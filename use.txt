@@ -1,0 +1,126 @@
+#安装
+conda env create --file environment.yml
+conda activate surfel_splatting
+cd submodules/diff-surfel-rasterization
+pip install .
+cd ../simple-knn
+pip install .
+cd ../..
+
+
+#数据集合：
+/home/onethree/dataset/360_v2/garden
+
+#环境进入与退出 
+conda activate surfel_splatting
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+conda deactivate
+
+#观测（conda环境中）
+conda activate surfel_splatting
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+/home/onethree/ws/Gaussian-Splatting-Monitor/SIBR_viewers/install/bin/SIBR_remoteGaussian_app
+#训练
+conda activate surfel_splatting
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+python train.py -s /home/onethree/dataset/sonar2DGS_dataset -m output/sonar 
+python train.py -s /home/onethree/dataset/sonar2DGS_dataset -m output/sonar --densify_debug
+python train.py -s /home/onethree/dataset/sonar2DGS_dataset_real -m output/sonar_real 
+python train.py -s /home/onethree/dataset/100lbs_bomb1 -m output/sonar_bomb1 
+python train.py -s /home/onethree/dataset/UXO_sonar/sonar_data2 -m output/sonar_UXOs4 --reflection_lr 0 
+python train.py -s /home/onethree/dataset/UXO_sonar/sonar_data_big -m output/sonar_UXOsbig --reflection_lr 0 
+
+python train.py -s /home/onethree/dataset/UXO_sonar/big -m output/sonar_UXOsbig3 --anti_noise 
+python train.py -s /home/onethree/dataset/UXO_sonar/big -m output/sonar_UXOsbig10 --anti_noise 
+
+python train.py -s /home/onethree/dataset/100lbs_bomb3 -m output/sonar_UXOr
+
+python train.py -s /home/onethree/dataset/sonar2DGS_dataset_rob_noice2 -m output/sonar_rob_noice2 
+
+python train.py -s /home/onethree/dataset/UXOreal -m output/sonar_UXOr4
+
+python train.py -s /home/onethree/dataset/sonar2DGS_dataset_open -m output/sonaropen 
+
+
+python train.py -s /home/onethree/dataset/sonar2DGS_dataset -m output/sonar12 --opacity_reset_mode once
+python train.py -s /home/onethree/dataset/sonar2DGS_dataset -m output/sonar13 --opacity_reset_mode none
+
+#抗噪声
+python train.py -s /home/onethree/dataset/sonar2DGS_dataset_rob_noice3 -m output/sonar_rob_noice3_3 --anti_noise
+python train.py -s /home/onethree/dataset/UXO_REAL/UXOreal1 -m output/UXOreal1 --anti_noise
+python train.py -s /home/onethree/dataset/mono_dataset -m output/mono_data --anti_noise
+python train.py -s /home/onethree/dataset/GHW -m output/GHW --anti_noise
+python train.py -s /home/onethree/dataset/floor_7class_10train -m output/floor_7class_10train --anti_noise
+python train.py -s /home/onethree/dataset/floor_7class_100train -m output/floor_7class_100train --anti_noise
+python train.py -s /home/onethree/dataset/floor_160551_100train_5test -m output/floor_160551_100train_5test --anti_noise
+python train.py -s /home/onethree/dataset/floor_155609_100train_5test -m output/floor_155609_100train_5test --anti_noise
+
+#抗噪声测试数据输出
+python train.py \
+  -s /home/onethree/dataset/mono_dataset \
+  -m output/mono_data_gt_export \
+  --export_anti_noise_ground_truths
+#冻结训练
+conda activate surfel_splatting
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+python train.py \
+#数据集合
+  -s /home/onethree/dataset/sonar2DGS_dataset \
+#输出位置
+  -m output/sonar_forward_frozen \
+#迭代次数
+  --iterations 1 \
+#初始化透明度，默认0.1
+  --initial_opacity 1.0 \
+#优化参数
+  --position_lr_init 0 \
+  --position_lr_final 0 \
+  --reflection_lr 0 \
+  --opacity_lr 0 \
+  --scaling_lr 0 \
+  --rotation_lr 0 \
+#测试迭代次数
+  --test_iterations 1 \
+#强度统计
+  --intensity_stats
+
+python train.py   -s /home/onethree/dataset/sonar2DGS_dataset   -m output/sonar_forward_frozen   --iterations 1   --initial_opacity 1.0   --position_lr_init 0   --position_lr_final 0   --reflection_lr 0   --opacity_lr 0   --scaling_lr 0   --rotation_lr 0   --test_iterations 1
+
+#反射冻结训练
+python train.py -s /home/onethree/dataset/sonar2DGS_dataset -m output/sonar_no_refl \
+  --densify_until_iter 0 \
+  --position_lr_init 0 --position_lr_final 0 \
+  --rotation_lr 0 \
+  --reflection_lr 0 
+  
+#位姿冻结训练
+python train.py -s /home/onethree/dataset/sonar2DGS_dataset -m output/sonar_no_pos \
+  --densify_until_iter 0 \
+  --position_lr_init 0 --position_lr_final 0 \
+  --rotation_lr 0 
+  
+#点云数量冻结
+python train.py -s /home/onethree/dataset/sonar2DGS_dataset -m output/sonar_no_plnum \
+  --densify_until_iter 0 
+  
+#一般训练
+python train.py -s /home/onethree/dataset/sonar2DGS_dataset -m output/sonar
+  
+主要运行
+1.反射冻结
+1.位姿冻结
+2.点云数量冻结
+3.增删
+
+深圳市南山区湘雅轩图文服务部
+平安银行深圳大学城支行
+11014754967000
+  
+#查看
+colmap gui
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+/home/onethree/ws/Gaussian-Splatting-Monitor/SIBR_viewers/install/bin/SIBR_remoteGaussian_app
+python view.py -s /home/onethree/dataset/360_v2/garden -m output/m360/garden
+
+本项目时ISAACSIM的一个插件，主要实现了基于声呐的仿真模型
+

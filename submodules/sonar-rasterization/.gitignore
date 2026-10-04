@@ -1,0 +1,7 @@
+build/
+sonar_rasterization.egg-info/
+dist/
+*.so
+.vscode
+**__pycache__**
+*.pyc

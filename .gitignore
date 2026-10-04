@@ -1,0 +1,56 @@
+# Python caches and package metadata
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+PKG-INFO
+
+# Build products, including those inside former submodules
+build/
+dist/
+*.so
+*.o
+*.a
+*.obj
+*.dll
+*.dylib
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# Local datasets and generated training / evaluation results
+/output/
+/outputs/
+/data/
+/eval/
+**/tmpoutput/
+*.log
+*.out
+
+# Generated diagnostic images; keep documentation images trackable
+/dense_r.png
+/dense_sum.png
+
+# Local editor, tool, credential, and environment files
+.vscode/
+.idea/
+/.codex
+/.agents/
+/.aws/
+/.venv/
+/venv/
+/.env
+/.env.*
+!/.env.example
+.DS_Store
+*.swp
+
+# One-time script used to move the previous Git metadata out of this project
+/shs/build.sh
+
+#备份文件
+/submodules/sonar-rasterization/cuda_rasterizer.zip

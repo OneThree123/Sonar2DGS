@@ -1,0 +1,25 @@
+name: surfel_splatting
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10.19
+  # 让 conda 自动解析兼容的 ffmpeg 和 typing_extensions，不要写死版本号
+  - ffmpeg
+  - typing_extensions
+  - pip=23.3.1
+  - pillow=10.2.0
+  - pip:
+    # 从官方源拉取支持 RTX 50 系列的 cu128 版本
+    - --extra-index-url https://download.pytorch.org/whl/cu128
+    - torch==2.10.0
+    - torchvision==0.25.0
+    - torchaudio==2.10.0
+    - open3d==0.18.0
+    - mediapy==1.1.2
+    - lpips==0.1.4
+    - scikit-image==0.21.0
+    - tqdm==4.66.2
+    - trimesh==4.3.2
+    - plyfile
+    - opencv-python

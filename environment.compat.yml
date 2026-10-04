@@ -1,0 +1,27 @@
+name: surfel_splatting
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - ffmpeg
+  - pillow
+  - typing_extensions
+  - pytorch=2.1.*
+  - torchvision=0.16.*
+  - torchaudio=2.1.*
+  - pytorch-cuda=12.1
+  - pip:
+      - open3d==0.18.0
+      - mediapy==1.1.2
+      - lpips==0.1.4
+      - scikit-image==0.21.0
+      - tqdm==4.66.2
+      - trimesh==4.3.2
+      - plyfile
+      - opencv-python
+      - submodules/diff-surfel-rasterization
+      - submodules/simple-knn
