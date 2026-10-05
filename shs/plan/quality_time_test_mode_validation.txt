@@ -1,0 +1,82 @@
+质量—训练时间测试模式实施与验证记录
+日期：2026-10-05
+对应规划：shs/plan/quality_time_test_mode_plan.txt
+
+已实施：
+  - 新增 --quality_time_test 和 --quality_save_test_images，默认关闭。
+  - 固定 26 个累计训练时间节点，完整组结束后到达/超过即触发。
+  - 保留 iteration/final，同组跨多个节点或多原因合并为一次评测、一条记录。
+  - iteration/final 独立触发时覆盖节点为空；迭代结束后不补测未来节点。
+  - 从数据集 dense_points3d.ply 初始化 Poisson 真值；按来源/重建配置/后端版本缓存。
+  - 真值初始化完成后才启动报告总时长；真值准备不计入累计训练时间或报告总时长。
+  - 单位固定为米；不需要 GT 路径或单位参数。
+  - 公共 utils/gaussian_mesh.py 提取现有 GS 过滤、surfel 采样、Poisson 和点云导出。
+    Scene 保存和质量评测均调用该模块，不再依赖 Git 忽略的 output/ 本地代码。
+  - 预测几何实际先导出 GS、采样并做 Poisson，再对预测 mesh 表面做固定种子、
+    面积加权 100000 点采样，计算其到真值三角面的单向平均距离。
+  - GT 的 Open3D RaycastingScene 空间结构复用，分块查询真实点到面距离，不依赖 rtree。
+  - 同组模型保存复用已生成的预测 mesh；几何失败后也不在保存时重复重建。
+  - 透明度重置移到下一组组前，其耗时归下一组；v3 检查点保存 pending 状态。
+    无新组可运行时不执行重置，续训组前执行一次；旧检查点不补做历史重置。
+  - 每个 run 单独输出 CSV、JSONL、配置、摘要和离线 HTML；支持历史截断和恢复。
+  - HTML 支持线性/对数时间轴、双图、悬停、触发原因、覆盖节点及结果表。
+  - 异常/KeyboardInterrupt 收尾关闭输出，不再启动 final 或补测。
+
+验证范围与结果：
+  最终完整测试集 64 项全部通过，包含两项真实 GPU 烟测（27.348 秒）。
+  1. 调度与真实训练循环的 CPU 集成验证：
+     - 相等边界、跨多个节点、time/iteration/final 三重合并，仅评测一次。
+     - 无 time 节点时 iteration/final 仍触发，不消费未到达节点。
+     - 输出延迟放大，训练耗时不变；仅增大真值初始化延迟，报告总时长也不变。
+     - 评测/保存在重置之前，下一组执行重置；停止/恢复后恰好执行一次。
+     - 无新组、异常、失败、旧检查点、日志未来记录截断及缺失历史处理通过。
+  2. 指标与几何验证：
+     - 已知图像验证逐测试视角 PSNR 平均和 original_image GT。
+     - 空测试集和正无穷状态明确，图像导出使用独立目录。
+     - 三角面内部样本距离为 0，法向偏移 d 的距离为 |d|，分块/整批一致。
+     - mesh 表面采样可复现，未改变全局 NumPy 随机状态。
+     - 真实点云 Poisson 与 GS-to-mesh/P2S 通过；无有效 GS 样本保留失败状态。
+     - 真值缓存第二次初始化不重建；采样上限的结果与原 linspace 截取口径一致。
+  3. 真实 GPU：
+     - 原训练时间烟测通过，覆盖增密、调试输出、导出、保存及恢复。
+     - 新质量烟测通过，真实训练、PSNR、预测 Poisson 和 P2S 均成功。
+     - 真值构建一次；相同组输出 mesh 与评测 mesh 字节一致；预算已到不启动测试。
+     - 恢复 pending reset 后再次评测成功，CSV 无重复时间节点，剩余节点未补测。
+     - GPU 烟测采用短时间节点和 Poisson depth=5，默认正式协议仍为固定 26 节点/depth=9。
+  4. 离线 Chromium：
+     - file:// 打开无脚本错误，不依赖网络。
+     - 空结果、零时间、常数、缺失指标、重复时间、线性/对数切换、悬停及表格通过。
+  5. 工程检查：
+     - Python 语法、git diff --check、新 CLI --help 通过。
+     - AST 对比确认训练渲染和损失表达式未改动。
+     - 依赖检查 pip check 通过。
+
+测试命令：
+  RUN_QUALITY_TIME_GPU_TESTS=1 RUN_TRAINING_TIME_GPU_TESTS=1 \
+      LD_LIBRARY_PATH=/home/onethree/miniconda3/envs/surfel_splatting/lib \
+      /home/onethree/miniconda3/envs/surfel_splatting/bin/python -m unittest discover -s tests -v
+
+默认测试命令不启用真实 GPU，用于常规回归；两个 GPU 用例按需启用。
+GPU 及真实 Poisson 用例的训练数据和模型输出全部位于临时目录，测试结束清理。
+未执行正式数据集的 3000/7000 秒长时实验。
+
+依赖兼容修复：
+  - 本机原 Open3D 0.18 / NumPy 2.2.6 在 Vector3dVector 转换时实际崩溃。
+  - 确认 NumPy 1.26.4 后几何路径正常；新增启动兼容检查，避免再进入已知崩溃组合。
+  - environment.yml 和 environment.compat.yml 固定 numpy==1.26.4、opencv-python<4.12。
+  - 项目专用 surfel_splatting 环境已调整为 NumPy 1.26.4、OpenCV 4.11.0.86，
+    Open3D 保持 0.18.0；原 NumPy 为 2.2.6、实际 OpenCV 为 4.13.0.92。
+  - 清理重复 OpenCV 元数据时已保留旧副本：
+    /tmp/sonar-opencv-metadata-backup-9isue0tp/opencv_python-4.10.0.dist-info。
+  - Playwright/Chromium 仅安装在 /tmp 的隔离验证目录，未加入项目训练依赖。
+
+使用命令：
+  python train.py -s <dataset> -m <output_dir> --eval --iterations <N> --quality_time_test
+  可选：--quality_save_test_images、--stop_after_training_seconds 7000。
+  需要恢复时按原规则设置 --checkpoint_iterations，并使用 --start_checkpoint。
+
+结果位置：
+  <output_dir>/quality_time_tests/reference/<reference_signature>/gt_poisson_mesh.ply
+  <output_dir>/quality_time_tests/run_<run_id>/metrics.csv
+  <output_dir>/quality_time_tests/run_<run_id>/quality_time.html
+  <output_dir>/quality_time_tests/run_<run_id>/evaluations/eval_<id>/geometry/pred_poisson_mesh.ply

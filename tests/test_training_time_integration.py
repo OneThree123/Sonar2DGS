@@ -24,6 +24,7 @@ from utils.loss_utils import masked_l1_loss, weighted_mean
 from utils.training_clock import (
     TIMING_POLICY_VERSION, TrainingClock, checkpoint_training_time, validate_seconds,
 )
+from utils.quality_time_schedule import OPACITY_RESET_POLICY_VERSION
 
 
 class TrainingTimeIntegrationTest(unittest.TestCase):
@@ -91,7 +92,8 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
             def restore(self, parameters, opt):
                 test.assertEqual(parameters, "model_state")
 
-        camera = SimpleNamespace(original_image=torch.ones(1, 2, 2), gt_alpha_mask=None)
+
+        camera = SimpleNamespace(original_image=torch.ones(1, 2, 2), gt_alpha_mask=None, image_name="test")
 
         class Scene:
             def __init__(self, dataset, gaussians, shuffle):
@@ -104,7 +106,7 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
             def getTestCameras(self):
                 return [camera]
 
-            def save(self, iteration):
+            def save(self, iteration, geometry_artifacts=None):
                 test.advance("model_geometry_export", test.output_delay, training=False)
                 test.pending_gpu += test.output_delay
 
@@ -207,6 +209,7 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
             LossCurveLogger=Logger, TrainingClock=clock_factory,
             GroupTrainingSchedule=GroupTrainingSchedule,
             TIMING_POLICY_VERSION=TIMING_POLICY_VERSION,
+            OPACITY_RESET_POLICY_VERSION=OPACITY_RESET_POLICY_VERSION,
             checkpoint_training_time=checkpoint_training_time, validate_seconds=validate_seconds,
             prepare_output_and_logger=lambda dataset: Writer(), network_gui=gui,
             render=render, training_report=report, masked_l1_loss=masked_l1_loss,
@@ -216,7 +219,8 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
         return namespace
 
-    def run_training(self, *, budget=20, checkpoint=None):
+    def run_training(self, *, budget=20, checkpoint=None, iterations=6,
+                     testing_iterations=None, quality_time_test=False):
         self.clock = None
         parser = ArgumentParser()
         model = ModelParams(parser)
@@ -224,7 +228,7 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         pipe = PipelineParams(parser)
         args = parser.parse_args([])
         args.model_path = str(self.root)
-        args.iterations = 6
+        args.iterations = iterations
         args.stop_after_training_seconds = budget
         args.densify_from_iter = 0
         args.densify_until_iter = 100
@@ -243,44 +247,47 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         ), contextlib.redirect_stdout(output):
             namespace["training"](
                 model.extract(args), opt.extract(args), pipe.extract(args),
-                [2, 4, 6], [2, 4, 6], [2, 4, 6], checkpoint, 2,
+                [2, 4, 6] if testing_iterations is None else testing_iterations,
+                [2, 4, 6], [2, 4, 6], checkpoint, 2, quality_time_test,
             )
         return output.getvalue()
 
     def test_structure_updates_cross_budget_and_all_outputs_are_excluded(self):
         text = self.run_training()
         self.assertIn("termination_reason=training_budget", text)
-        self.assertEqual(self.clock.finish(), 25)  # LR + 2*(forward+GPU tail+updates) + densify/reset.
+        self.assertEqual(self.clock.finish(), 22)  # Reset is deferred until the next group's start.
         self.assertEqual(self.events.count("optimizer"), 2)
         state = torch.load(self.root / "chkpnt2.pth", weights_only=False)
-        self.assertEqual(state["training_time_seconds"], 25)
+        self.assertEqual(state["training_time_seconds"], 22)
+        self.assertEqual(state["pending_opacity_reset"]["origin_group"], 1)
+        self.assertNotIn("opacity_reset", self.events)
         self.assertEqual(state["version"], 3)
         self.assertEqual(state["completed_groups"], 1)
         self.assertIn("capture", self.events)
         self.assertTrue(self.writers[-1].closed)
         time_scalars = [item[1] for item in self.writers[-1].scalars if item[0] == "train/training_time_seconds"]
-        self.assertEqual(time_scalars, [8, 25])
+        self.assertEqual(time_scalars, [8, 22])
 
     def test_evaluation_gui_and_output_delays_do_not_change_training_time(self):
         self.run_training(budget=0)
-        self.assertEqual(self.clock.finish(), 75)
+        self.assertEqual(self.clock.finish(), 72)
         self.assertIn("GUI_receive", self.events)
         self.output_delay = 10000
         self.run_training(budget=0)
-        self.assertEqual(self.clock.finish(), 75)
+        self.assertEqual(self.clock.finish(), 72)
 
     def test_resume_uses_checkpoint_and_skips_already_reached_budget(self):
         self.run_training()
         checkpoint = str(self.root / "chkpnt2.pth")
         self.events.clear()
         text = self.run_training(checkpoint=checkpoint)
-        self.assertEqual(self.clock.finish(), 25)
+        self.assertEqual(self.clock.finish(), 22)
         self.assertNotIn("optimizer", self.events)
         self.assertIn("no new group", text)
         self.run_training(budget=40, checkpoint=checkpoint)
-        self.assertEqual(self.clock.finish(), 50)
+        self.assertEqual(self.clock.finish(), 47)
         state = torch.load(self.root / "chkpnt4.pth", weights_only=False)
-        self.assertEqual(state["training_time_seconds"], 50)
+        self.assertEqual(state["training_time_seconds"], 47)
         with (self.root / "loss_curves/losses.csv").open() as file:
             self.assertEqual([int(row["iteration"]) for row in csv.DictReader(file)], [1, 2, 3, 4])
 
@@ -289,7 +296,7 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         legacy = self.root / "legacy.pth"
         torch.save(("model_state", 2), legacy)
         self.run_training(checkpoint=str(legacy))
-        self.assertEqual(self.clock.finish(), 25)
+        self.assertEqual(self.clock.finish(), 22)
         self.assertIsNotNone(self.loggers[-1].archive_path)
         state = torch.load(self.root / "chkpnt4.pth", weights_only=False)
         self.assertEqual(state["training_time_scope"], "since_resume")
@@ -300,10 +307,12 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         state["version"] = 2
         for key in ("training_time_seconds", "timing_policy_version", "training_time_scope"):
             del state[key]
+        state.pop("pending_opacity_reset")
+        state.pop("opacity_reset_policy_version")
         checkpoint = self.root / "version2.pth"
         torch.save(state, checkpoint)
         self.run_training(checkpoint=str(checkpoint))
-        self.assertEqual(self.clock.finish(), 25)
+        self.assertEqual(self.clock.finish(), 22)
         state = torch.load(self.root / "chkpnt4.pth", weights_only=False)
         self.assertEqual(state["training_time_scope"], "since_resume")
 
@@ -320,7 +329,7 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
                 self.raise_in_evaluation = exception
                 with self.assertRaises(type(exception)):
                     self.run_training()
-                self.assertEqual(self.clock.finish(), 25)
+                self.assertEqual(self.clock.finish(), 22)
                 self.assertTrue(self.writers[-1].closed)
                 self.assertTrue(self.loggers[-1]._csv_file.closed)
 

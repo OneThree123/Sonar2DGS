@@ -1,6 +1,7 @@
 import os
 import random
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -10,14 +11,12 @@ from scene.dataset_readers import sceneLoadTypeCallbacks, storePly
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos
-from output.gs2d_batch_mesh import (
+from utils.gaussian_mesh import (
+    GAUSSIAN_MESH_ALPHA_MIN,
     export_poisson_mesh_from_gaussian_ply,
     export_poisson_mesh_from_pointcloud_ply,
     export_sampled_pointcloud_from_gaussian_ply,
 )
-
-
-GAUSSIAN_MESH_ALPHA_MIN = 0.099
 
 
 def camera_info_to_JSON(id, camera_info, split):
@@ -117,18 +116,27 @@ class Scene:
             ))
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
-            if getattr(args, "save_reference_mesh", False):
+            if (getattr(args, "save_reference_mesh", False)
+                    and not getattr(args, "_quality_reference_managed", False)):
                 self.save_reference_mesh(source_path / "dense_points3d.ply")
             print("Saving initial Gaussians")
             self.save(0)
 
-    def save(self, iteration):
+    def save(self, iteration, geometry_artifacts=None):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         point_cloud_file = os.path.join(point_cloud_path, "point_cloud.ply")
         sampled_pointcloud_file = os.path.join(point_cloud_path, "sampled_surface_points.ply")
         poisson_mesh_file = os.path.join(point_cloud_path, "poisson_mesh.ply")
 
         self.gaussians.save_ply(point_cloud_file)
+        if geometry_artifacts is not None:
+            if geometry_artifacts.get("sampled_points_path"):
+                shutil.copy2(geometry_artifacts["sampled_points_path"], sampled_pointcloud_file)
+            if geometry_artifacts.get("pred_mesh_path"):
+                shutil.copy2(geometry_artifacts["pred_mesh_path"], poisson_mesh_file)
+            else:
+                print(f"No valid evaluation mesh for iteration {iteration}; not repeating failed reconstruction.")
+            return
         try:
             export_sampled_pointcloud_from_gaussian_ply(
                 point_cloud_file,

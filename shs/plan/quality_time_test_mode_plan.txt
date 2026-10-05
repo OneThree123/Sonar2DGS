@@ -1,0 +1,360 @@
+任务 2：新增质量—训练时间观测模式的实施规划（修订版）
+日期：2026-10-05
+项目：/home/onethree/ws/2d-gaussian-splatting
+参考：quality_time_curve_improvement_plan.txt 的任务 2，以及本次五项修订建议。
+状态：已按此规划实现并完成 CPU、Poisson、GPU 及离线 HTML 验证。
+验证详情：shs/plan/quality_time_test_mode_validation.txt；正式数据集长时实验尚未执行。
+
+一、修订约定与目标
+
+1. 固定新增时间节点为下列 26 个累计训练时间，单位秒：
+   10,20,30,50,75,100,120,150,200,300,400,500,650,800,
+   1000,1250,1500,1750,2000,2250,2500,3000,4000,5000,6000,7000。
+2. 关于“删除原本的 time 测试触发”：本修订按删除旧时间触发方案、保留本次新增
+   26 节点调度理解。取消此前规划的旧 time/预设独立测试入口，统一由组末调度器决策。
+   保留原本 iteration/final 触发，其他事件的调度条件不变。
+   当前代码尚无旧 quality_time_preset 实现，不将它作为新增接口引入。
+3. 时间节点、iteration 和 final 在同一组出现时，合并触发原因，仅执行一次完整评测。
+   不为不同原因分别调用 training_report() 或分别重建预测 mesh。
+4. 真值无需命令行输入：从 <dataset>/dense_points3d.ply 做 Poisson 重建，
+   得到本项目指定的几何真值网格。项目初始化时构建并保存一次，各次评测及续训复用。
+5. 不要求输入单位；模型、密集点云和两个 mesh 的坐标单位默认均为米，P2S 记为 m。
+6. 几何评测必须先按当前代码流程将 GS 转为 mesh：过滤、surfel 采样、Poisson 重建，
+   再计算预测 mesh 相对于固定真值 mesh 的 P2S；不直接以 GS 中心或 surfel 点代替预测 mesh。
+7. 透明度重置移至下一组开始前。当前组评测、模型保存及检查点均发生在重置之前。
+   重置仍是训练操作，其耗时计入下一组训练时间；原事件生成规则不变。
+8. 迭代用尽后不补测未到达的时间节点；保留 final 评测时记录 final 原因，
+   covered_target_seconds 只包含实际已到达的节点，不能把剩余节点记为已测试。
+9. 全部测试结果集中保存到独立目录，记录 CSV 并生成离线 HTML；本功能默认关闭。
+
+相对上一版规划的修正：
+  - 不再屏蔽 iteration/final，不再坚持“仅时间触发”。
+  - 移除 --quality_gt_mesh 和 --quality_p2s_unit，数据来源与单位自动确定。
+  - 几何指标改为预测 Poisson mesh 到真值 Poisson mesh 的表面距离。
+  - 组末评测在透明度重置之前，采用下一组组前延迟执行方案。
+  - 真值重建不仅不计入训练时间，也不计入本功能报告的运行总时长。
+
+二、当前实现与复用范围
+
+已核对代码：
+  - utils/training_clock.py 已实现 TrainingClock、training_region()、excluded_region()
+    和 snapshot_seconds()，TIMING_POLICY_VERSION=1；本次复用该时钟。
+  - train.py 当前顺序为 optimizer.step()、参数约束、增密/剪枝、透明度重置，
+    然后冻结时间并评测；需将最后一项重置移至下一组组前。
+  - training_report() 当前支持迭代触发及 force=stop_requested，计算 test/train PSNR/L1，
+    不返回结果；需拆分触发判定与评测，保留原迭代事件和最终评测语义。
+  - 显式时间预算继续通过 --stop_after_training_seconds 组末停止；预算停止不再
+    额外独立调用一次评测，而作为 final 原因合并进统一组末决策。
+  - Scene.save() 已导出 Gaussian PLY、sampled_surface_points.ply 和 poisson_mesh.ply。
+    若评测和保存同组发生，需复用相同模型状态的几何产物，避免重复重建。
+  - Scene.save_reference_mesh() 已读取 dense_points3d.ply，调用
+    export_poisson_mesh_from_pointcloud_ply()；当前只由 --save_reference_mesh 控制，
+    未做缓存匹配，失败只警告。新模式应自动准备真值，失败在训练开始前报错。
+  - export_poisson_mesh_from_gaussian_ply() 已实现 GS 过滤、确定性采样和 Poisson 重建。
+  - 两条 Poisson 导出路径都使用 run_poisson_reconstruction()；点云缺少法向时估计法向，
+    随后尝试一致定向、Poisson 重建、密度过滤和网格清理。
+  - output/gs2d_batch_mesh.py 位于 Git 忽略目录；公共重建/采样逻辑需提取到 utils/，
+    Scene 和评测共用同一套实现，现有本地批处理脚本按需改为调用公共模块。
+  - v3 检查点保存纯训练时间；旧 v2/tuple 仍按 since_resume 从续训段 0 秒计时。
+  - --iterations 仍向上量化到完整组：
+    effective_iterations = ceil(requested_iterations / group_size) * group_size。
+
+三、参数与文件规划
+
+新增 CLI：
+  --quality_time_test
+      启用固定 26 节点的质量观测，并保留 iteration/final 评测；默认 False。
+  --quality_save_test_images
+      可选：额外导出各次测试的渲染图和 GT；默认不逐次导出图像。
+
+不新增 GT 路径或单位输入参数；自动使用 dataset.source_path/dense_points3d.ply 和 m。
+不引入旧 --quality_time_preset / --quality_test_seconds 对外触发入口。
+内部调度器接受节点序列，便于使用短时间节点进行验证。
+
+原参数继续生效：
+  --test_iterations：继续按现有 GroupTrainingSchedule 量化并触发 iteration 评测。
+  --iterations：控制训练组上限；最终完整组可合并 final 评测。
+  --stop_after_training_seconds：显式训练时间预算，不被节点列表隐式设置。
+  --save_iterations / --checkpoint_iterations：保存条件不变，不自行新增测试触发。
+  --opacity_reset_mode / --opacity_reset_interval / --opacity_reset_value：
+      生成事件的条件和值不变，只调整实际执行顺序。
+
+建议新增模块：
+  utils/quality_time_schedule.py       固定节点、待触发节点及消费状态。
+  utils/gaussian_mesh.py              提取现有过滤、确定性采样和 Poisson 重建公共实现。
+  utils/geometry_metrics.py           固定真值加载、mesh 表面采样及分块 P2S。
+  utils/quality_curve_logger.py       独立 CSV/JSONL、摘要、恢复和离线 HTML。
+  tests/test_quality_time_schedule.py 时间/迭代/final 合并与节点消费验证。
+  tests/test_gaussian_mesh.py         真值缓存及现有 GS-to-mesh 协议验证。
+  tests/test_geometry_metrics.py      mesh-to-mesh P2S、确定性与分块验证。
+  tests/test_quality_time_logs.py     日志、HTML 与恢复验证。
+  tests/test_quality_time_integration.py 评测顺序、延迟重置和计时排除验证。
+
+修改文件：
+  train.py：CLI、配置传递、统一组末决策、返回指标、延迟重置、检查点及收尾。
+  scene/__init__.py：公共网格模块导入、真值准备与缓存复用、模型保存产物复用。
+  output/gs2d_batch_mesh.py：本地脚本复用公共实现，不维护两套重建算法。
+  现有训练时间集成测试：按重置移至下一组的时间归属更新预期，保留时钟排除验证。
+
+四、初始化真值网格：仅一次且排除计时
+
+1. 新模式在首次训练组开始前自动读取 <dataset>/dense_points3d.ply，
+   验证有限坐标、有效点数量和重建依赖，不要求 --save_reference_mesh。
+2. 复用 export_poisson_mesh_from_pointcloud_ply() 的流程，不使用初始化 GS 或 input.ply。
+   保存到 <model_path>/quality_time_tests/reference/<reference_signature>/gt_poisson_mesh.ply。
+3. 复用当前默认重建配置，并完整记录到 reference/metadata.json：
+   max_points=600000、poisson_depth=9、density_quantile=0.02、remove_outlier=False，
+   法向估计 KNN=30、一致定向邻域 30、Poisson scale=1.1，以及网格清理规则。
+   点云已有法向时沿用代码中的归一化逻辑；缺少法向时按现有方式估计。
+4. 元数据包含数据集绝对路径、dense_points3d.ply 内容签名、重建配置和算法版本。
+   同一项目启动/续训时，若缓存匹配且 mesh 有有效面片，直接加载，不重复构建。
+   数据源或协议改变时视为新的参考配置，初始化阶段构建对应新缓存，不混用旧曲线。
+   已有 Scene 的 reference_mesh 只有在来源/配置可验证匹配时才直接复用。
+5. 本模式开启时统一管理真值准备：--save_reference_mesh 不再另外发起一次相同重建。
+   如需保留旧 reference_mesh.ply 位置，使用同一产物复制或链接，不重复 Poisson。
+6. 临时输出验证有效后原子替换缓存；构建失败不留下被当作有效缓存的空网格。
+   失败在正式训练前报错，不进入训练后反复重试真值重建。
+7. 完成真值准备及其他初始化、同步初始化 GPU 工作后，才开始训练时钟和报告计时。
+   真值读取、采样/法向处理、Poisson、保存及加载均不计入累计训练时间。
+   wall_seconds 定义为初始化完成后到评测时刻的运行经过时间，包含训练和评测输出，
+   因起点在真值准备之后，也不包含真值重建时间；本功能报告的 total_run_seconds 同口径。
+   如记录 reference_setup_seconds，仅作为独立准备耗时字段，不加入上述总时长。
+8. 后续所有节点共享同一真值网格和空间索引，禁止逐节点重建真值。
+
+五、统一组末触发与一次评测约束
+
+调度状态：
+  targets：固定升序 26 节点。
+  consumed_targets：已持久化评测所覆盖的时间节点，包括已记录失败的节点。
+  missed_before_resume_targets：续训前已到达但没有历史评测的节点，仅标为历史缺测。
+  next_target：最小的尚未消费且未历史缺测的时间节点。
+
+组前/组末流程（伪代码）：
+  初始化真值缓存、日志和计时
+  对每个可执行训练组：
+      在 training_clock.training_region() 内：
+          如果有上一组留下的 pending_opacity_reset，执行一次并清除状态
+          执行当前组训练、优化器更新、参数约束及组末增密/剪枝
+          当前组若命中透明度重置事件，仅登记 pending_opacity_reset，不执行重置
+      进入 training_clock.excluded_region()：
+          actual_seconds = training_clock.snapshot_seconds()
+          更新 completed_groups，判断迭代上限和显式训练预算
+          due_targets = 尚未消费且未历史缺测、target <= actual_seconds 的节点
+          trigger_reasons = []
+          若 due_targets 非空，加入 time（仅本次新增节点调度）
+          若命中原 testing_events，加入 iteration
+          若是正常最终完整组或预算终止完整组，加入 final
+          若 trigger_reasons 非空：
+              冻结实际训练时间、组号、迭代与运行经过时间
+              仅执行一次完整评测：PSNR → GS-to-mesh → P2S
+              仅写入一条结果，记录全部触发原因和 due_targets
+              结果持久化后消费 due_targets，刷新 HTML
+          按原事件保存模型和检查点，复用该组的预测 mesh
+          若训练结束，退出；否则开始下一组
+  收尾只刷新摘要/HTML、关闭文件，不执行额外评测或透明度重置
+
+规则：
+  - 使用 actual_seconds >= next_target，刚好到达节点也触发。
+  - 一组跨越任意多个时间节点仅一次评测、一次预测 Poisson 重建、一行日志。
+  - iteration/final 单独触发时，covered_target_seconds=[]，仍记录实际时间和指标。
+  - 评测、mesh 重建、日志和保存时间均不进入训练时间；冻结值贯穿整次评测。
+  - 所有节点消费完毕后，iteration/final 仍按其原事件进行评测。
+  - 不新增其他测试入口，不为预算停止额外执行一次 force 测试。
+  - 迭代上限/预算结束以外的异常或 KeyboardInterrupt，不为了 final 再启动评测。
+  - 恢复后无新组可执行时不启动 final 或补测；已有最终记录只用于重建页面。
+  - 原模式关闭本功能时保留原评测入口；透明度顺序调整作用于统一训练循环，
+    使所有评测均发生在同组重置前，其他事件生成与保存条件保持原规则。
+
+示例：
+  A. 前一组 8 秒，当前组 12 秒：time 评测一次，覆盖 [10]，横轴为 12。
+  B. 10 已消费，当前组从 18 到 54 秒：time 评测一次，覆盖 [20,30,50]。
+  C. 当前组同时跨过 [120,150]、命中测试迭代且为最终组：
+     trigger_reasons=[time,iteration,final]，只评测一次，覆盖 [120,150]。
+  D. 100 及以前已消费，最终组结束于 117 秒：
+     final 评测一次，covered_target_seconds=[]，120 及以后标为 not_reached。
+  E. 全部训练结束于 9 秒：保留最终组 final 记录，26 个时间节点均未到达。
+  F. 当前组无时间节点但命中原 iteration：评测一次，不消费任何未来时间节点。
+  G. 已消费到 3000 秒，设置 3000 秒预算，停止组结束于 3012 秒：
+     final 评测一次；如该组才首次跨过 3000，则 time/final 合并一次，剩余节点不补测。
+
+六、透明度重置顺序、时间归属与检查点
+
+1. 保留现有 interval/once/none 及 densify_until_iter 的事件生成条件。
+   组 g 命中重置事件，仅登记“由组 g 触发、在组 g+1 开始前执行”的 pending 状态。
+2. 组 g 的模型顺序为：更新 → 增密/剪枝 → 同步/冻结时间 → 评测 → 保存。
+   此时透明度尚未重置，尤其避免 reset_opacity_value=0.01 低于 mesh 过滤阈值 0.099，
+   导致同组评测几何空缺或测到刚重置状态。
+3. 下一组确实将运行时，在训练计时区间内先执行 pending reset，再进行新组数据准备、
+   前向和优化；重置的 CPU/GPU 耗时计入下一组，不修改上一评测的横轴时间。
+4. pending 状态保存 origin_group、origin_iteration、value 和状态版本；
+   检查点中的 GS/优化器参数仍为评测时的重置前状态，并显式携带待执行操作。
+5. 从该检查点恢复时，仅在下一新组前执行一次 pending reset，随后清除。
+   不在加载检查点时执行；若时间预算已到或组数已用尽，也不执行。
+6. 最终组留下 pending reset 时，保留在最终检查点和摘要中，不为了它额外启动训练。
+   用户以后提高迭代上限继续训练时，在第一新组前执行。
+7. 旧检查点没有 pending 字段时默认无待执行重置，不根据历史 iteration 推断补做，
+   因旧代码已在保存前完成重置。重置顺序策略另记 opacity_reset_policy_version。
+8. 日志分别区分“重置已安排”和“重置已执行”，记录原触发组与实际执行组。
+   更新原集成测试的预期顺序；最后一组不执行待重置，累计训练时间也不能算入未执行工作。
+
+七、PSNR 与 mesh 几何指标
+
+PSNR：
+  - 拆分触发判断和评测主体，training_report() 返回可记录的 test 指标和状态。
+  - 完整遍历 scene.getTestCameras()，固定顺序，沿用输出归一化、clamp 和 psnr()。
+  - 每个测试视角先算 PSNR，再取算术平均；使用 original_image，不替换成 anti_noise_image。
+  - 原 train 诊断视角及 TensorBoard 输出可沿用，但不作为 test PSNR 曲线数据。
+  - 初始化验证测试集非空，不用训练集替代。
+
+预测 mesh：
+  - 使用评测时、透明度重置前的 GS 参数，遵循当前 Scene.save() 的 PLY 导出格式。
+  - 复用 export_poisson_mesh_from_gaussian_ply()，实际经过 GS 过滤、确定性采样和 Poisson。
+  - 沿用 Scene 当前 alpha_min=0.099，以及导出函数默认配置：
+    scale_min=1e-8、scale_percentile=99.0、samples_per_gaussian=4、radius_multiplier=1.0、
+    max_points=600000、poisson_depth=9、density_quantile=0.02、remove_outlier=False。
+    激活方式、四元数顺序和法向来源也按现有实现记录，保持与保存的 mesh 一致。
+  - 每次评测保存 gaussian.ply、sampled_surface_points.ply、pred_poisson_mesh.ply，
+    采样只执行一次并供 Poisson 使用，避免先单独采样导出再由 Poisson 重复采样。
+  - 同组 Scene.save() 若需要相同几何结果，按模型状态及配置签名复用/复制已有产物。
+    不同组或不同配置不得复用旧 mesh；模型改变后禁止使用过期产物。
+
+P2S：
+  - 指标方向为预测 mesh 表面到固定 GT mesh 表面，单位 m。
+    P2S = mean_p distance(p, GT_mesh_surface)，p 取自预测 Poisson mesh 表面。
+  - 预测 mesh 使用固定样本数的面积加权表面采样，默认建议 100000 点，固定种子。
+    样本数、采样算法和种子写入配置；独立局部随机生成器不得改变训练随机状态。
+  - 距离为样本到 GT 三角面的真实最近欧氏距离，分块查询并复用 GT 空间索引。
+    不使用 GS 样本、预测顶点或最近 GT 顶点距离替代该表面协议。
+  - 不逐节点重新对齐/缩放；默认直接使用数据集世界坐标和米。
+  - 此处是基于两个重建 mesh 的单向 P2S 估计，不额外混入 Chamfer 或法向一致性。
+  - evaluation_seconds 包含完整 PSNR、预测采样、预测 Poisson、mesh 表面采样及 P2S，
+    以及必要几何文件导出和 GPU 完成等待；均排除出累计训练时间。
+  - 评测不修改模型、梯度、优化器或训练随机状态；相同模型重复评测按固定协议验证一致性，
+    Poisson 后端浮点结果允许合理数值容差。
+
+状态与失败：
+  - 自动 GT 缺失、无有效点/面、初始化依赖错误：训练开始前报错。
+  - 单节点预测采样为空、Poisson 无有效面或距离计算失败：PSNR 保留，P2S 留空，
+    记录 geometry_status/p2s_status/error；持久化后消费该次覆盖节点，不自动重复测试。
+  - 严重 CUDA/运行错误停止并收尾，不为了补几何而二次评测。
+  - NaN/Infinity 不写作 0；严格 JSON 使用 null，PSNR 正无穷单独标记状态。
+  - 主记录写入失败不提交节点；HTML 失败保留记录和状态，可从日志重建页面。
+
+八、独立结果目录、CSV 与 HTML
+
+目录结构：
+  <model_path>/quality_time_tests/
+      reference/<reference_signature>/
+          gt_poisson_mesh.ply      项目级固定真值，构建一次后复用。
+          metadata.json            来源签名、重建协议及独立准备耗时。
+      run_<run_id>/
+          config.json              节点、触发、GT 引用、单位、采样及重置策略。
+          metrics.csv              每次完整评测一行。
+          metrics.jsonl            结构化主记录，用于恢复和重建。
+          summary.json             停止原因、消费/未执行节点及 pending reset。
+          quality_time.html        PSNR/P2S 双图和评测记录表。
+          evaluations/
+              eval_<id>/           iteration/group 在指标记录中保存。
+                  geometry/
+                      gaussian.ply
+                      sampled_surface_points.ply
+                      pred_poisson_mesh.ply
+                  renders/         仅开启图片导出时创建。
+                  ground_truth/    同上。
+
+原模型/优化器检查点仍按原保存位置管理；每次新运行创建 run_id，恢复复用对应 run_id。
+真值在 reference/ 统一存放，不在每个节点复制一份，也不写入每个测试子目录。
+
+CSV 字段建议：
+  schema_version,run_id,session_id,evaluation_id,iteration,group,
+  requested_iterations,effective_iterations,timing_policy_version,training_time_scope,
+  opacity_reset_policy_version,trigger_reasons,covered_target_seconds,
+  actual_training_seconds,wall_seconds,evaluation_seconds,test_psnr_db,p2s,p2s_unit,
+  num_test_views,num_poisson_input_points,num_pred_mesh_vertices,num_pred_mesh_faces,
+  num_geometry_samples,geometry_status,psnr_status,p2s_status,pred_mesh_path,error
+
+记录约定：
+  - trigger_reasons、covered_target_seconds 为 JSON 数组字符串，由 csv.DictWriter 转义。
+  - 单组单次评测一行；iteration/final 独立触发也进入相同日志，不只记录 time。
+  - 无未来节点的补写，无一结果多时间点复制；缺失值留空，p2s_unit 固定 m。
+  - JSONL 持久化成功后更新 CSV 并提交消费状态；不一致时由有效 JSONL 重建。
+  - summary 保存停止原因、实际训练时间、total_run_seconds、节点覆盖、失败数量及待重置。
+    total_run_seconds 不包含初始化真值重建，剩余时间节点标为 not_reached。
+  - session_id 区分续训进程；wall_seconds 每次初始化完成后重新起算，不冒充累计训练时间。
+
+HTML：
+  - 离线打开，无 CDN；共享实际训练时间横轴显示 test PSNR (dB) / P2S (m)。
+  - 默认对数时间轴，可切换线性；零时间记录保留在表格和线性轴，不伪造正值。
+  - 悬停显示实际时间、time/iteration/final 原因、覆盖节点、iteration、group、指标和评测耗时。
+  - 显示测试次数、已覆盖节点数 / 26、未执行节点、总时长及结束原因。
+  - 缺失指标断开曲线，不默认平滑或插补；单点、空表、常数、重复时间可显示。
+  - 同组多触发只显示一个点；通过时间节点覆盖标记区分附加 iteration/final 记录。
+  - 每次评测后原子替换 HTML，收尾只更新页面/摘要，不再次调用评测。
+
+九、检查点恢复与协议一致性
+
+1. 外层检查点保持 version=3，增加 quality_time_test_state 和 pending_opacity_reset，
+   各自带 schema_version；记录 run_id、配置签名、目标列表、消费节点、历史缺测、
+   最后评测 ID、GT 签名、计时范围和重置顺序策略。
+2. 从新模式检查点恢复，按模型 iteration 和提交位置截断未来日志，重建 CSV/HTML。
+   已消费节点不重复；pending reset 仅在下一新组前执行一次。
+3. 已消费状态对应的历史日志丢失时明确标记缺失，不在恢复瞬间补测旧模型时间点。
+4. 无质量状态的 v3 检查点首次启用模式，保留累计训练时间并创建新 run：
+   已到达节点标为 missed_before_resume，后续新完成组按未来节点及 iteration/final 调度。
+5. 旧 v2/tuple 延续 since_resume，从续训段 0 秒重新调度，并明确标记时间口径。
+   不补做缺少 pending 字段的历史重置。
+6. GT 缓存按来源/配置签名复用；缺失且来源可验证时只在恢复初始化阶段重建，
+   不计入报告总时长。协议/来源不一致不混写原 run 的质量曲线。
+7. 恢复时组数已用尽或时间预算已达到，不启动训练、重置或评测，只重建已有输出。
+
+十、实施顺序与验收
+
+阶段 A：提取公共几何路径和初始化缓存
+  - 将现有点云/GS-to-mesh 逻辑提取到 utils/，保证 Scene.save() 和评测同一协议。
+  - 自动读取 dense_points3d.ply，构建/保存/校验 GT，处理 --save_reference_mesh 重复入口。
+  - 验证首次构建一次、多个节点零次真值重建、续训加载缓存、来源变化不会误用。
+  - 给 GT 构建注入延迟，确认 training_time_seconds 和报告 total_run_seconds 均不增加。
+
+阶段 B：统一触发与延迟重置
+  - 保留 iteration/final，移除旧时间独立入口，加入 26 节点调度并合并触发。
+  - 验证节点相等、单节点、多节点、time/iteration/final 三重重合只调用一次。
+  - 验证没到下一时间节点时 iteration/final 仍可测试，且不消费未来节点。
+  - 验证当前组评测/保存早于 reset；下一组 reset 早于前向，重置耗时计入下一组。
+  - 验证终止时不重置，恢复 pending 操作恰好一次，旧检查点不重复重置。
+
+阶段 C：完整评测、日志与 HTML
+  - 完整测试集 PSNR、GS-to-mesh、预测 mesh 面积采样和 GT 表面距离。
+  - 几何解析测试：面内点距离 0、法向偏移 d 距离 |d|、分块与整批一致。
+  - Poisson 集成测试检查有效面、配置一致及重建产物复用，不要求 Poisson 后距离严格为 0。
+  - 验证 P2S 输入实际来自预测 mesh，单位 m，不使用原始 surfel 作为最终距离样本。
+  - 验证无训练随机状态变化、失败值保存、单评测单行和离线页面交互。
+
+阶段 D：恢复与训练联调
+  - 中断恢复截断未来记录、节点去重、缓存复用、pending reset 恢复。
+  - 延长 PSNR/预测 Poisson/指标/日志/保存，训练时间不变，运行总时长增加。
+  - 验证 final 不覆盖未到达节点，异常/无新组可执行时不启动评测。
+  - 回归原训练时钟、完整组调度和其他事件条件，更新重置顺序相关预期。
+  - 真实 GPU 短烟测前重新检查环境；若不可用明确标记尚未完成，不以 CPU 测试替代。
+
+最终验收清单：
+  [ ] 新增 26 个节点，移除旧时间测试入口，iteration/final 及其他事件条件保留。
+  [ ] 同组多节点/多触发仅评测一次、预测重建一次、CSV 一行。
+  [ ] dense_points3d.ply 自动 Poisson 得到 GT，初始化一次并缓存，排除训练与报告总时长。
+  [ ] 无 GT/单位必填参数，P2S 默认米。
+  [ ] GS 先按现有采样/Poisson 流程转 mesh，再计算 mesh-to-mesh P2S。
+  [ ] 评测/保存早于透明度重置；下一组组前执行 pending reset，续训恰好执行一次。
+  [ ] 迭代用尽后不补测时间节点，final 记录不伪造节点覆盖。
+  [ ] 独立目录含参考 mesh、预测 mesh、CSV、摘要与离线 HTML。
+  [ ] 评测耗时不计入训练时间，报告总时长排除真值准备。
+  [ ] 原模式与新模式的组调度、触发和恢复检查通过。
+
+十一、使用方式
+
+按迭代上限运行：
+  python train.py -s <dataset> -m <output_dir> --eval --iterations <N> --quality_time_test
+
+显式设置 7000 秒训练预算：
+  python train.py -s <dataset> -m <output_dir> --eval --iterations <N> --quality_time_test --stop_after_training_seconds 7000
+
+数据集目录需包含 dense_points3d.ply；单位默认米，无需额外传参。
+26 节点本身不设置训练预算；训练提前结束时只保留实际评测记录，未到达时间节点不补测。

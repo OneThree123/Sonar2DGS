@@ -96,8 +96,10 @@ to the correct interval. CSV, TensorBoard, progress, GUI and time budgets use
 the same clock; the CUDA Event `iter_time` metric has been removed.
 
 Use `--stop_after_training_seconds 3000` (or `7000`) to stop at the first complete
-training group that reaches the budget, after its densification and opacity
-reset. The actual time may exceed the budget by one group. Set it to `0` to
+training group that reaches the budget, after its densification. Opacity resets
+scheduled by a group run before the next group, after evaluation and saving;
+pending resets are preserved in checkpoints and are skipped when no new group
+will run. The actual time may exceed the budget by one group. Set it to `0` to
 disable time stopping; `--iterations` remains an independent limit.
 Version 3 checkpoints preserve the clock. Legacy checkpoints start at zero for
 the resumed segment (`training_time_scope=since_resume`); incompatible or
@@ -106,6 +108,39 @@ restarted loss histories are preserved under `loss_curves/archive_<id>/`.
 Timing checks: `python -m unittest discover -s tests -v`. In an environment with
 the compiled CUDA extensions, enable the real GPU smoke test with
 `RUN_TRAINING_TIME_GPU_TESTS=1 python -m unittest discover -s tests -p test_training_time_gpu.py -v`.
+
+For sonar quality versus training time, enable the independent observation mode:
+
+```bash
+python train.py -s <dataset> -m <output_dir> --eval --iterations 30000 --quality_time_test
+```
+
+This adds training-time nodes at 10, 20, 30, 50, 75, 100, 120, 150, 200, 300,
+400, 500, 650, 800, 1000, 1250, 1500, 1750, 2000, 2250, 2500, 3000, 4000,
+5000, 6000 and 7000 seconds. Existing `--test_iterations` and final evaluation
+remain active. A completed group merges all crossed nodes and trigger reasons
+into one evaluation and one CSV row, using actual training time. Unreached
+nodes are not evaluated after training ends. A time budget still requires
+`--stop_after_training_seconds` explicitly.
+
+The dataset must contain `dense_points3d.ply`. Its Poisson reference mesh is
+prepared once and cached before timing starts. Predictions use the same GS
+sampling/Poisson pipeline as model exports; P2S is the mean distance from
+100,000 fixed-seed, area-weighted predicted mesh surface samples to reference
+triangles, in meters. All evaluation and export time is excluded from training.
+The reported total run duration also excludes reference preparation.
+
+Results are saved under `<output_dir>/quality_time_tests/`: `reference/` holds
+the cached GT mesh, and `run_<id>/` contains `metrics.csv`, `metrics.jsonl`,
+`summary.json`, per-evaluation meshes and `quality_time.html`. The HTML works
+offline with linear/log time axes and hover details. Use
+`--quality_save_test_images` to export renders and ground truths there too.
+Use `--checkpoint_iterations <iterations...>` to save resumable checkpoints;
+quality history and pending resets resume through `--start_checkpoint`.
+
+The provided Open3D 0.18 environments pin NumPy 1.26.4 and OpenCV below 4.12
+to avoid incompatible NumPy 2 geometry conversions. Enable the quality GPU
+smoke test with `RUN_QUALITY_TIME_GPU_TESTS=1 python -m unittest discover -s tests -p test_quality_time_gpu.py -v`.
 
 ## Testing
 ### Bounded Mesh Extraction

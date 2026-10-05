@@ -27,6 +27,8 @@ from utils.group_schedule import GroupTrainingSchedule
 from utils.image_utils import psnr, render_net_image
 from utils.intensity_diagnostics import format_raw_intensity_stats
 from utils.loss_curve_logger import LossCurveLogger
+from utils.quality_time_monitor import QualityTimeMonitor
+from utils.quality_time_schedule import OPACITY_RESET_POLICY_VERSION
 from utils.training_clock import (
     TIMING_POLICY_VERSION, TrainingClock, checkpoint_training_time, validate_seconds,
 )
@@ -417,7 +419,8 @@ def get_anti_noise_settings(opt):
     return min_component_size, min_neighbors, open_iterations, clear_top_ratio
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, loss_curve_plot_interval=100):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, loss_curve_plot_interval=100,
+             quality_time_test=False, quality_save_test_images=False):
     stop_after_training_seconds = validate_seconds(
         getattr(opt, "stop_after_training_seconds", 0.0), "stop_after_training_seconds"
     )
@@ -440,6 +443,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "opacity_reset_interval must be positive when opacity reset is enabled, "
             f"got {opacity_reset_interval}"
         )
+    if opacity_reset_mode != "none" and (
+        not math.isfinite(float(opt.opacity_reset_value)) or not 0 < float(opt.opacity_reset_value) < 1
+    ):
+        raise ValueError("opacity_reset_value must be finite and in the range (0, 1)")
 
     lowpass_s_init = float(opt.lowpass_s_init)
     lowpass_s_final = float(opt.lowpass_s_final)
@@ -483,6 +490,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians = GaussianModel()
     gaussians.initial_opacity = dataset.initial_opacity
 
+    dataset._quality_reference_managed = bool(quality_time_test)
     scene = Scene(dataset, gaussians, shuffle=False)
     train_cameras = scene.getTrainCameras()
     if not train_cameras:
@@ -653,6 +661,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
 
     initial_training_seconds, training_time_scope = checkpoint_training_time(checkpoint_state)
+    pending_opacity_reset = None
+    if isinstance(checkpoint_state, dict):
+        policy = checkpoint_state.get("opacity_reset_policy_version", OPACITY_RESET_POLICY_VERSION)
+        if policy != OPACITY_RESET_POLICY_VERSION:
+            raise ValueError("Unsupported checkpoint opacity reset policy")
+        pending_opacity_reset = checkpoint_state.get("pending_opacity_reset")
+        if pending_opacity_reset is not None:
+            if (pending_opacity_reset.get("schema_version") != 1
+                    or pending_opacity_reset.get("origin_group") != completed_groups
+                    or pending_opacity_reset.get("origin_iteration") != first_iter
+                    or not math.isfinite(pending_opacity_reset.get("value", float("nan")))
+                    or not 0 < pending_opacity_reset["value"] < 1):
+                raise ValueError("Invalid pending opacity reset in checkpoint")
+    quality_monitor = None
+    if quality_time_test:
+        try:
+            quality_monitor = QualityTimeMonitor(
+                dataset, scene, group_schedule, checkpoint_state=checkpoint_state,
+                initial_seconds=initial_training_seconds, training_time_scope=training_time_scope,
+                save_images=quality_save_test_images,
+            )
+        except BaseException:
+            if tb_writer is not None:
+                tb_writer.close()
+            raise
     legacy_resume = checkpoint_state is not None and (
         not isinstance(checkpoint_state, dict) or checkpoint_state.get("version") == 2
     )
@@ -661,12 +694,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             "[Training time] Legacy checkpoint has no pure training time history; "
             "starting at 0s (scope=since_resume). Any time budget applies to this resumed segment."
         )
-    loss_curve_logger = LossCurveLogger(
-        scene.model_path, first_iter, loss_curve_plot_interval,
-        training_time_scope=training_time_scope,
-        resume_training_seconds=initial_training_seconds,
-        legacy_resume=legacy_resume,
-    )
+    try:
+        loss_curve_logger = LossCurveLogger(
+            scene.model_path, first_iter, loss_curve_plot_interval,
+            training_time_scope=training_time_scope,
+            resume_training_seconds=initial_training_seconds,
+            legacy_resume=legacy_resume,
+        )
+    except BaseException:
+        try:
+            if quality_monitor is not None:
+                quality_monitor.close(reason="error", actual_seconds=initial_training_seconds,
+                                      groups=completed_groups, iteration=first_iter,
+                                      pending_reset=pending_opacity_reset)
+        finally:
+            if tb_writer is not None:
+                tb_writer.close()
+        raise
     atexit.register(loss_curve_logger.close)
     if loss_curve_logger.archive_path:
         print(f"[Loss curves] Previous history archived to {loss_curve_logger.archive_path}")
@@ -720,10 +764,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if stop_requested:
         print("[Timed stop] Restored training time already reaches the budget; no new group will run.")
     try:
+        # Initialization and reference reconstruction precede both reported clocks.
+        torch.cuda.synchronize(training_device)
+        if quality_monitor is not None:
+            quality_monitor.start()
         for group_idx in range(completed_groups + 1, group_schedule.total_groups + 1):
             if stop_requested:
                 break
             with training_clock.training_region():
+                if pending_opacity_reset is not None:
+                    gaussians.reset_opacity(pending_opacity_reset["value"])
+                    applied_reset = pending_opacity_reset
+                    pending_opacity_reset = None
+                else:
+                    applied_reset = None
                 group_start_step = group_schedule.group_start_iteration(group_idx)
                 group_end_step = group_schedule.group_end_iteration(group_idx)
                 lowpass_variance = annealed_lowpass_variance(
@@ -751,6 +805,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 "normal": 0.0,
                 "total": 0.0,
             }
+            if applied_reset is not None:
+                print(f"[GROUP {group_idx}] Applied opacity reset scheduled by "
+                      f"group {applied_reset['origin_group']} before training this group.")
             print(
                 f"\n[GROUP {group_idx}/{group_schedule.total_groups}] "
                 f"iterations {group_start_step + 1}-{group_end_step}, "
@@ -888,7 +945,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             )
 
                         if is_group_end and group_idx in opacity_reset_events:
-                            gaussians.reset_opacity(opt.opacity_reset_value)
+                            pending_opacity_reset = {
+                                "schema_version": 1, "origin_group": group_idx,
+                                "origin_iteration": group_end_step, "value": float(opt.opacity_reset_value),
+                            }
 
                 with training_clock.excluded_region(), torch.no_grad():
                     training_time_seconds = training_clock.snapshot_seconds()
@@ -936,7 +996,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     if is_group_end and group_idx in opacity_reset_events:
                         requested = opacity_reset_events[group_idx]
                         print(
-                            f"\n[GROUP {group_idx}] Reset opacity at effective "
+                            f"\n[GROUP {group_idx}] Scheduled opacity reset after evaluating effective "
                             f"iteration {group_end_step}; requested iteration(s) "
                             f"{requested}"
                         )
@@ -1032,19 +1092,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 group_idx,
                             )
 
-                        training_report(
-                            tb_writer,
-                            group_end_step,
-                            effective_testing_iterations,
-                            scene,
-                            render,
-                            (pipe, 1.0, lowpass_variance),
-                            log_intensity_stats=getattr(
-                                pipe, "intensity_stats", False
-                            ),
-                            force=stop_requested,
-                            anti_noise_enabled=anti_noise_enabled,
-                        )
+                        geometry_artifacts = None
+                        if quality_monitor is not None:
+                            geometry_artifacts = quality_monitor.evaluate(
+                                gaussians, actual_seconds=training_time_seconds,
+                                iteration=group_end_step, group=group_idx,
+                                iteration_trigger=group_idx in testing_events,
+                                final_trigger=stop_requested or group_idx == group_schedule.total_groups,
+                                report=lambda output_dir, save_images: training_report(
+                                    tb_writer, group_end_step, effective_testing_iterations,
+                                    scene, render, (pipe, 1.0, lowpass_variance),
+                                    log_intensity_stats=getattr(pipe, "intensity_stats", False),
+                                    force=True, anti_noise_enabled=anti_noise_enabled,
+                                    output_dir=output_dir, save_test_images=save_images,
+                                ),
+                            )
+                        else:
+                            training_report(
+                                tb_writer, group_end_step, effective_testing_iterations,
+                                scene, render, (pipe, 1.0, lowpass_variance),
+                                log_intensity_stats=getattr(pipe, "intensity_stats", False),
+                                force=stop_requested, anti_noise_enabled=anti_noise_enabled,
+                            )
 
                         if (
                             group_end_step in effective_saving_iterations
@@ -1054,7 +1123,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 f"\n[GROUP {group_idx} / ITER {group_end_step}] "
                                 "Saving Gaussians"
                             )
-                            scene.save(group_end_step)
+                            if geometry_artifacts is None:
+                                scene.save(group_end_step)
+                            else:
+                                scene.save(group_end_step, geometry_artifacts=geometry_artifacts)
 
                         if (
                             group_end_step in effective_checkpoint_iterations
@@ -1079,7 +1151,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 "group_size": group_schedule.group_size,
                                 "requested_iterations": group_schedule.requested_iterations,
                                 "effective_iterations": group_schedule.effective_iterations,
+                                "opacity_reset_policy_version": OPACITY_RESET_POLICY_VERSION,
+                                "pending_opacity_reset": pending_opacity_reset,
                             }
+                            if quality_monitor is not None:
+                                checkpoint_state["quality_time_test_state"] = quality_monitor.state()
                             torch.save(checkpoint_state, checkpoint_path)
 
                     if not stop_requested:
@@ -1163,17 +1239,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             f"termination_reason={termination_reason}"
         )
         try:
-            progress_bar.close()
+            if quality_monitor is not None:
+                quality_monitor.close(reason=termination_reason, actual_seconds=final_training_seconds,
+                                      groups=completed_groups, iteration=global_step,
+                                      pending_reset=pending_opacity_reset)
         finally:
             try:
-                loss_curve_logger.close()
+                progress_bar.close()
             finally:
-                atexit.unregister(loss_curve_logger.close)
-                if tb_writer is not None:
-                    try:
-                        tb_writer.flush()
-                    finally:
-                        tb_writer.close()
+                try:
+                    loss_curve_logger.close()
+                finally:
+                    atexit.unregister(loss_curve_logger.close)
+                    if tb_writer is not None:
+                        try:
+                            tb_writer.flush()
+                        finally:
+                            tb_writer.close()
 
 
 def save_tensor_image(image, path):
@@ -1255,11 +1337,17 @@ def training_report(
     log_intensity_stats=False,
     force=False,
     anti_noise_enabled=False,
+    output_dir=None,
+    save_test_images=True,
 ):
     if not force and iteration not in testing_iterations:
         return
 
     torch.cuda.empty_cache()
+    result = {"test_psnr_db": None, "num_test_views": 0, "psnr_status": "empty_test_set"}
+    device = scene.gaussians.get_xyz.device
+    image_output_dir = output_dir if output_dir is not None else os.path.join(
+        scene.model_path, "test_renders", "iteration_{}".format(iteration))
     validation_configs = (
         {"name": "test", "cameras": scene.getTestCameras()},
         {"name": "train", "cameras": scene.getTrainCameras()[:5]},
@@ -1279,34 +1367,28 @@ def training_report(
                     render_pkg["raw_intensity"],
                 ))
             render_pkg = normalize_render_intensity_for_output(render_pkg, viewpoint)
-            image = torch.clamp(render_pkg["r_intensity"], 0.0, 1.0).to("cuda")
-            gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+            image = torch.clamp(render_pkg["r_intensity"], 0.0, 1.0).to(device)
+            gt_image = torch.clamp(viewpoint.original_image.to(device), 0.0, 1.0)
 
-            if config["name"] == "test":
+            if config["name"] == "test" and save_test_images:
                 render_path = os.path.join(
-                    scene.model_path,
-                    "test_renders",
-                    "iteration_{}".format(iteration),
+                    image_output_dir,
                     "renders",
                     "{:05d}_{}.png".format(idx, viewpoint.image_name),
                 )
                 save_tensor_image(image, render_path)
 
                 gt_path = os.path.join(
-                    scene.model_path,
-                    "test_renders",
-                    "iteration_{}".format(iteration),
+                    image_output_dir,
                     "ground_truth",
                     "{:05d}_{}.png".format(idx, viewpoint.image_name),
                 )
                 save_tensor_image(gt_image, gt_path)
 
                 if anti_noise_enabled and hasattr(viewpoint, "anti_noise_image"):
-                    anti_noise_gt = viewpoint.anti_noise_image.to("cuda")
+                    anti_noise_gt = viewpoint.anti_noise_image.to(device)
                     anti_noise_gt_path = os.path.join(
-                        scene.model_path,
-                        "test_renders",
-                        "iteration_{}".format(iteration),
+                        image_output_dir,
                         "ground_truth_anti_noise",
                         "{:05d}_{}.png".format(idx, viewpoint.image_name),
                     )
@@ -1322,6 +1404,12 @@ def training_report(
 
         psnr_test /= len(config["cameras"])
         l1_test /= len(config["cameras"])
+        if config["name"] == "test":
+            value = float(psnr_test.item())
+            status = "ok" if math.isfinite(value) else (
+                "positive_infinity" if value == float("inf") else "non_finite")
+            result.update(test_psnr_db=value if math.isfinite(value) else None,
+                          num_test_views=len(config["cameras"]), psnr_status=status)
         print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config["name"], l1_test, psnr_test))
 
         if tb_writer:
@@ -1329,6 +1417,9 @@ def training_report(
             tb_writer.add_scalar(config["name"] + "/loss_viewpoint/psnr", psnr_test, iteration)
 
     torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return result
 
 
 if __name__ == "__main__":
@@ -1345,6 +1436,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--loss_curve_plot_interval", type=int, default=100)
+    parser.add_argument("--quality_time_test", action="store_true",
+                        help="Record PSNR/mesh P2S at 26 training-time nodes and iteration/final triggers.")
+    parser.add_argument("--quality_save_test_images", action="store_true",
+                        help="Export test renders inside the independent quality results directory.")
     parser.add_argument(
         "--export_anti_noise_ground_truths",
         action="store_true",
@@ -1375,6 +1470,8 @@ if __name__ == "__main__":
             args.checkpoint_iterations,
             args.start_checkpoint,
             args.loss_curve_plot_interval,
+            args.quality_time_test,
+            args.quality_save_test_images,
         )
     except KeyboardInterrupt:
         print("\nTraining interrupted. Loss curves were written to the output folder.")
