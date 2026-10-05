@@ -1,0 +1,228 @@
+任务 1：只统计实际训练时间的修改规划
+日期：2026-10-05
+项目：/home/onethree/ws/2d-gaussian-splatting
+状态：已依据本规划修改代码；CPU 验证通过。真实 GPU 烟测因驱动初始化失败未完成。
+参考：shs/plan/quality_time_curve_improvement_plan.txt 的“步骤 1：统一训练时钟”。
+本次范围：替换现有计时，统一统计、输出、断点恢复和时间控制的数据来源。
+后续 PSNR/P2S 时间节点调度及质量曲线不在本次实现范围内，但预留统一接口。
+
+一、确定统计口径
+
+唯一训练时间字段：training_time_seconds，单位秒。
+定义：已完成的有效训练区间的实际经过时间之和，使用 time.perf_counter()。
+每个区间覆盖 CPU 执行、GPU 执行以及等待本区间 GPU 工作完成的时间。
+CPU/GPU 并行部分按实际经过时间计算一次，不将 CPU 时间与 GPU kernel 时间相加。
+
+计入：
+  1. 每组相机复制、随机排序及用于训练的调度参数计算。
+  2. 每步训练样本、GT 和掩码的准备、设备拷贝及训练所需预处理。
+  3. 学习率更新、训练前向、损失及正则项计算、反向传播。
+  4. 优化器更新、参数约束、梯度清零。
+  5. 增密所需梯度/可见性等状态累积。
+  6. 组末增密、剪枝、透明度重置，包括其所需 CPU/GPU 运算及同步等待。
+  7. 为这些训练操作进行的分支判断、数据结构更新等必要 CPU 工作。
+
+不计入：
+  1. 测试和诊断视角渲染、测试图像预处理、PSNR/L1/P2S 等评估计算。
+  2. 几何采样、PLY/Poisson/网格导出，以及 Scene.save() 的全部操作。
+  3. 检查点 capture、状态组装、序列化及文件保存。
+  4. CSV、TensorBoard、终端日志、进度条刷新、HTML 绘图。
+  5. 只为日志服务的标量提取、EMA、组均值、统计量和字符串格式化。
+  6. 增密 debug 专用统计与打印；训练算法实际依赖的统计仍计入。
+  7. GUI 连接、收发、等待、交互渲染及图像转换。
+  8. 初始化、一次性数据集/GT 加载、一次性 GT 去噪缓存、模型/优化器初始化、检查点加载恢复和日志初始化。
+     此项沿用参考步骤 1 的初始化边界；循环内训练数据准备必须计入。
+  9. 收尾日志、HTML 刷新及 writer 的 flush/close。
+
+本次要求优先于参考文件：不新增 wall_seconds、evaluation_seconds 或其他耗时统计。
+统一训练时钟为基础行为，替换旧计时，不依赖后续质量监测开关。
+“删除原有时间统计”指删除旧计时逻辑及旧 kernel 时间输出，不删除已有实验文件。
+
+二、现有代码问题与删除清单
+
+train.py 当前问题：
+  - training_timer_start + output_write_seconds 只扣除了部分写入时间。
+    training_report() 的测试渲染和指标、TensorBoard、终端和 GUI 仍可能计入。
+  - iter_start/iter_end 使用 CUDA Event，只覆盖前向到反向的一段，遗漏 CPU、优化器和组末结构调整。
+  - current_training_time_seconds() 在增密/重置前调用，组末记录及停止判断不完整。
+  - gaussians.capture() 在 run_output_write() 外执行，检查点构建仍可能计入。
+  - 从 losses.csv 恢复时间，旧字段的口径与新目标不一致，且时间不随检查点保存。
+  - densify_and_prune() 内部有 debug 专用 GPU 统计和打印，不能只包裹外层 print。
+
+拟删除/替换：
+  - iter_start、iter_end、record()、elapsed_time() 及 TensorBoard 的 iter_time。
+  - training_timer_start、output_write_seconds、exclude_output_write_time()、run_output_write()。
+  - 旧 current_training_time_seconds() 的实现，由统一时钟直接提供时间。
+  - training_report() 的 record_output_write_time 参数及图片保存周围的零散计时。
+  - adjust_progress_bar_elapsed() 的旧式耗时扣减；进度条显示统一训练时钟的值。
+  - LossCurveLogger.last_training_time_seconds() 作为训练时钟恢复来源的调用。
+
+保留 losses.csv 和 training_time.html 的输出用途，替换其 training_time_seconds 数据来源。
+禁止以“总运行时间减去排除项”重建第二套训练时间，也不保留 kernel 时间作为控制依据。
+
+三、统一时钟模块
+
+新增 utils/training_clock.py，TrainingClock 建议接口：
+  - training_region()：进入有效训练区间，结束时同步并累计。
+  - excluded_region()：在有效区间内临时排除诊断/输出，支持嵌套。
+  - snapshot_seconds()：返回已同步、已冻结的累计训练时间。
+  - finish()：结束最后一个有效区间，冻结最终值；重复调用不重复累计。
+  - 从有效检查点设置 initial_seconds，保存 timing_policy_version 和 training_time_scope。
+
+实现约束：
+  1. 默认暂停，初始化完成后才显式进入训练区间；只累加正向声明的训练区间。
+  2. 使用 perf_counter，不使用系统日期时间，保存非负、有限的秒数。
+  3. 同步对象是训练张量所在 CUDA 设备，避免依赖不明确的默认设备。
+     CPU 测试可注入假计时源和同步回调，无须加载 CUDA 扩展。
+  4. 离开训练区间：先 torch.cuda.synchronize(training_device)，再读取时间并暂停。
+     这样训练 GPU 工作及其等待计入训练，不能先暂停再等待。
+  5. 进入训练区间：先确保初始化/评估/GUI/导出 GPU 工作完成，再开始计时。
+     这样非训练 GPU 工作及其等待留在暂停区间。
+  6. 纯 CPU 输出区间不产生 GPU 工作时，恢复前可跳过多余同步；该属性由调用点明确声明。
+     测试、GUI、导出及 GPU debug 统计按可能产生 GPU 工作处理。
+  7. 嵌套 excluded_region 只由最外层切换状态；退出时恢复进入前状态。
+     已暂停时进入排除区间，退出后仍保持暂停，不得意外启动计时。
+  8. 上下文管理器用 try/finally 维护状态；异常收尾调用 finish()，不计入清理耗时。
+  9. 暂停状态下反复读时间不得改变时间或新增 GPU 同步。
+ 10. 不在每个 add_scalar()/item() 周围同步。将同一步输出合并为一个暂停区间。
+     训练边界同步属于该测量方案的开销，不能据此宣称完全无测量扰动。
+
+四、训练循环如何调整
+
+保持现有完整组调度、相机顺序和训练事件顺序：
+  optimizer.step() → enforce_parameter_bounds() → zero_grad()
+  → 组末 densify_and_prune() → reset_opacity() → 评估/输出/保存。
+
+推荐结构示意（不是已实现代码）：
+
+  初始化数据、模型、恢复检查点、日志；时钟保持暂停
+  如果恢复时间已达到预算：不进入新组，按现有结束输出策略收尾
+  for 每个完整训练组：
+      在 training_region 中计算组参数、更新学习率、准备/打乱相机
+      在暂停状态输出组开始日志
+      for 每个训练视角：
+          在 training_region 中：
+              准备样本 → 前向 → 损失 → 反向
+              增密状态累积 → 优化器更新 → 参数约束 → 清零
+              如果组末：执行本组增密/剪枝和透明度重置
+              必要的内部 debug 单独进入 excluded_region
+          区间退出时同步训练 GPU，并冻结 t = snapshot_seconds()
+          在暂停状态：
+              提取日志标量、更新日志 EMA/组均值
+              CSV/TensorBoard/进度条/终端输出，使用同一个 t
+              如果组末：根据 t 判断预算与后续时间事件
+              如果组末：现有测试、模型保存、capture + 检查点保存
+              GUI 连接/渲染/收发/等待
+          如果是结束组：输出完成后保持暂停
+      如果组末达到预算：退出外层循环
+  finish()，在暂停状态输出最终训练时间并关闭日志
+
+要点：
+  - 每步日志仍可保留，但它记录的是本步完整训练工作结束后的时间。
+  - 组末那一行的时间必须已经包含本组增密/剪枝/重置，不能沿用调整前快照。
+  - 组均值和 EMA 仅用于输出，移入暂停区间；训练使用的张量计算留在训练区间。
+  - 整段 training_report() 在暂停状态执行，不再只排除图片写入。
+  - Scene.save() 整段排除，包含内部导出和异常打印。
+  - gaussians.capture()、checkpoint_state 构建、torch.save() 整段排除。
+  - GUI 使用暂停中的冻结训练时间展示；GUI 等待不能推进训练时钟。
+  - 结束时不为打印/close 提前恢复训练计时。
+
+增密 debug 的额外处理：
+  - scene/gaussian_model.py 的 debug 专用 norm/quantile/count/item/格式化及打印需要排除。
+  - 可为 densify_and_prune() 增加可选的诊断执行回调，由 train.py 注入 excluded_region。
+    在原来的参数状态位置执行诊断，保持增密/剪枝顺序与诊断含义。
+  - 不把整段 densify_and_prune() 排除；分裂/剪枝判定需要的 any()/count 等仍计入。
+  - 不通过默认关闭现有 debug 来满足时间口径。
+
+五、时间输出与后续控制共用同一数据
+
+输出：
+  - losses.csv：training_time_seconds 使用同步后的累计快照。
+  - training_time.html：沿用该字段；生成 HTML 的时间排除。
+  - TensorBoard：统一输出 train/training_time_seconds，单位秒，删除 iter_time。
+  - 终端/进度条/GUI：显示同一累计值，避免默认 elapsed/rate/ETA 被当作训练时间。
+    进度条可保留完成比例、损失和高斯数量，以自定义 Training time 字段显示时间。
+  - 最终输出：报告实际累计训练时间、结束组、iteration 和停止原因。
+  - 日志/检查点保存 timing_policy_version 与 training_time_scope，便于识别旧数据。
+
+时间控制：
+  - stop_after_training_seconds 保留现有参数，0 表示关闭，正值表示预算秒数。
+    同时拒绝负数、NaN 和 Infinity，避免无效条件静默生效。
+  - 只在完整组的最后一步及结构调整完成、GPU 同步后判断 t >= budget。
+    不在组中间因预算中断训练，也不读取另一个计时器作判断。
+  - 到达预算时停止启动下一组；本组已经完成，随后测试与保存均不推进 t。
+  - 允许超过目标一个训练组的耗时，输出真实 t，不强制截成 3000/7000。
+  - 即使预算只在组末增密/重置阶段跨过，也必须在本组结束时停止。
+  - 迭代上限仍是独立条件；未达到预算便用尽迭代时，如实记录 iteration_limit。
+  - 新口径检查点恢复时，如保存的 t 已达到预算，不额外训练一个组。
+  - 后续质量时间节点直接读取这个组末 t，并在评估开始前冻结它。
+    节点目标只用于触发；记录/曲线使用实际 t。此次不实现节点与指标调度。
+
+六、检查点与旧结果
+
+新检查点升级为 version=3，新增：
+  training_time_seconds：与该检查点模型对应的组末冻结值。
+  timing_policy_version：新“纯训练 CPU/GPU 实际经过时间”口径的版本。
+  training_time_scope：full_training 或 since_resume。
+原有 gaussians、completed_groups、global_step、group_size 等字段保持兼容。
+
+新口径恢复：
+  - 以检查点时间为权威来源，日志时间不能覆盖它。
+  - 检查时间有限且非负，并核对组边界及口径版本；未知新版本明确报错。
+  - 日志只保留检查点 iteration 及以前的有效记录，删除未来记录后继续写入。
+  - 缺失日志时也能从检查点准确续计，最终累计值包括保存的训练历史。
+
+旧 version=2 和 tuple 检查点：
+  - 模型参数仍可恢复，但没有可验证的纯训练历史耗时。
+  - 不再把旧 losses.csv 的混合耗时自动作为新时钟 initial_seconds。
+  - 旧检查点续训从本段 0 秒计时，training_time_scope=since_resume，明确提示历史耗时未知。
+    若设置时间预算，它控制本次续训段的纯训练耗时；不能宣称是模型自初始化的总预算。
+  - 新日志不把旧口径行与新口径行连成同一训练时间曲线。
+    重写日志前归档旧 CSV/HTML，并以无覆盖的目录保存；训练损失历史可以单独查看。
+  - 之后保存的新检查点保留 since_resume 范围标记，不伪装成完整训练时间。
+  - 已有实验文件不批量删除、不改写其旧时间。正式总训练时间比较从新运行开始。
+
+七、实施文件与顺序
+
+1. utils/training_clock.py（新增）
+   先实现独立时钟、同步边界、嵌套排除、初始偏移和最终冻结。
+2. tests/test_training_clock.py（新增）
+   用假计时源/同步回调覆盖状态及 GPU 等待归属，无须真实 GPU。
+3. train.py
+   删除旧计时，调整训练/诊断/输出边界，统一时间输出与组末预算判断。
+   更新 training_report() 参数，加入 v3 检查点及异常收尾。
+4. scene/gaussian_model.py
+   排除增密 debug 专用诊断，保持实际训练运算及其执行顺序。
+5. utils/loss_curve_logger.py
+   增加时间口径/范围标记，处理旧日志归档与恢复，保留现有曲线输出。
+   必要时同步调整 utils/view_loss_curves.py 的旧/新字段读取兼容性。
+6. arguments/__init__.py（仅确有需要时）
+   保留已有停止参数；不新增第二种训练时间或计时模式。
+7. 集成验证
+   检查现有组调度测试，执行短预算 GPU 烟测和检查点恢复测试。
+
+八、验收标准
+
+时钟单元验证：
+  [ ] 训练区间累计、暂停不累计、多段累计、嵌套排除不重复扣除。
+  [ ] 暂停中排除/读快照不会启动计时；异常后状态正确，finish() 幂等。
+  [ ] 同步回调模拟训练 GPU 等待：等待包含在训练时间。
+  [ ] 同步回调模拟评估/GUI GPU 等待：等待不包含在训练时间。
+  [ ] 恢复 initial_seconds 后时间连续，非法时间被拒绝。
+
+训练集成验证：
+  [ ] 优化器、约束、增密状态累积、增密/剪枝及重置全部在训练区间。
+  [ ] 在增密/重置中注入可控延迟，训练时间和组末预算相应推进。
+  [ ] 在测试/PSNR/P2S 占位回调、保存/capture、日志/HTML、GUI 中注入延迟，训练时间不推进。
+       假时钟下精确验证；真实 GPU 下只要求测量误差范围内一致，不要求不同运行逐秒相等。
+  [ ] GPU 测试工作结束后再开始下一训练区间，不把评估的异步尾部计入训练。
+  [ ] 增密 debug 内部统计/打印延迟不计入，其实际结构修改仍计入。
+  [ ] 预算在组末结构调整中跨过时，本组结束立即停止，不额外训练一组。
+  [ ] CSV、TensorBoard、最终输出、GUI 和预算读取同一个累计快照。
+  [ ] 新检查点无日志也能续计；旧格式可以恢复模型并明确标记 since_resume。
+  [ ] 达到预算的新检查点不启动新组；未达到预算的迭代上限停止原因正确。
+  [ ] 正常结束、异常、KeyboardInterrupt 的输出/清理不计入最终训练时间。
+  [ ] 现有 tests/test_group_schedule.py 通过，组调度和训练事件顺序不变。
+
+正式 3000/7000 秒实验前，只需确认：新计时口径、完整组停止、足够的迭代上限、可恢复的检查点时间。
+本规划完成后可先实施任务 1；后续时间节点评估直接复用训练时钟，无须再次更改时间定义。

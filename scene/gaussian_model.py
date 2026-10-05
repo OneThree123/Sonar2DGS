@@ -1,4 +1,5 @@
 import torch
+from contextlib import nullcontext
 import numpy as np
 from utils.general_utils import (
     inverse_sigmoid,
@@ -789,53 +790,55 @@ class GaussianModel:
         max_gaussians=None,
         debug=False,
         iteration=None,
+        diagnostic_context=None,
     ):
+        diagnostic_context = diagnostic_context or nullcontext
         grads = self.xyz_gradient_accum / self.denom
         grads[~torch.isfinite(grads)] = 0.0
 
         n_before = self.get_xyz.shape[0]
         budget_prune_mask = self._budget_prune_mask_by_opacity(max_gaussians)
-        prune_budget = self._count_mask(budget_prune_mask)
         if budget_prune_mask.any().item():
             valid_points_mask = ~budget_prune_mask
             self.prune_points(budget_prune_mask)
             grads = grads[valid_points_mask]
 
         if debug:
-            grad_values = torch.norm(grads, dim=-1)
-            valid_grad_mask = self.denom.reshape(-1) > 0
-            scale_values = self.get_scaling.max(dim=1).values
-            opacity_values = self.get_opacity.squeeze()
-            scale_threshold = self.percent_dense * extent
-            selected_by_grad = grad_values >= max_grad
-            redirected_clone_mask = torch.logical_and(
-                selected_by_grad,
-                scale_values <= scale_threshold,
-            )
-            original_split_mask = torch.logical_and(
-                selected_by_grad,
-                scale_values > scale_threshold,
-            )
-            visible_accum = self._count_mask(valid_grad_mask)
-            stats = {
-                "iteration": iteration,
-                "n_before": n_before,
-                "max_grad": float(max_grad),
-                "min_opacity": float(min_opacity),
-                "scale_threshold": float(scale_threshold),
-                "max_screen_size": max_screen_size,
-                "max_gaussians": max_gaussians,
-                "visible_accum": visible_accum,
-                "n_after_budget": self.get_xyz.shape[0],
-                "prune_budget": prune_budget,
-                "redirected_clone_count": self._count_mask(redirected_clone_mask),
-                "original_split_count": self._count_mask(original_split_mask),
-                "split_count": self._count_mask(selected_by_grad),
-                "grad_stats": self._format_tensor_stats("grad", grad_values[valid_grad_mask]),
-                "opacity_stats": self._format_tensor_stats("opacity", opacity_values),
-                "scale_stats": self._format_tensor_stats("scale_max", scale_values),
-                "radii_stats": self._format_tensor_stats("max_radii2D", self.max_radii2D),
-            }
+            with diagnostic_context():
+                grad_values = torch.norm(grads, dim=-1)
+                valid_grad_mask = self.denom.reshape(-1) > 0
+                scale_values = self.get_scaling.max(dim=1).values
+                opacity_values = self.get_opacity.squeeze()
+                scale_threshold = self.percent_dense * extent
+                selected_by_grad = grad_values >= max_grad
+                redirected_clone_mask = torch.logical_and(
+                    selected_by_grad,
+                    scale_values <= scale_threshold,
+                )
+                original_split_mask = torch.logical_and(
+                    selected_by_grad,
+                    scale_values > scale_threshold,
+                )
+                visible_accum = self._count_mask(valid_grad_mask)
+                stats = {
+                    "iteration": iteration,
+                    "n_before": n_before,
+                    "max_grad": float(max_grad),
+                    "min_opacity": float(min_opacity),
+                    "scale_threshold": float(scale_threshold),
+                    "max_screen_size": max_screen_size,
+                    "max_gaussians": max_gaussians,
+                    "visible_accum": visible_accum,
+                    "n_after_budget": self.get_xyz.shape[0],
+                    "prune_budget": self._count_mask(budget_prune_mask),
+                    "redirected_clone_count": self._count_mask(redirected_clone_mask),
+                    "original_split_count": self._count_mask(original_split_mask),
+                    "split_count": self._count_mask(selected_by_grad),
+                    "grad_stats": self._format_tensor_stats("grad", grad_values[valid_grad_mask]),
+                    "opacity_stats": self._format_tensor_stats("opacity", opacity_values),
+                    "scale_stats": self._format_tensor_stats("scale_max", scale_values),
+                    "radii_stats": self._format_tensor_stats("max_radii2D", self.max_radii2D),
+                }
         else:
             stats = None
 
@@ -845,40 +848,47 @@ class GaussianModel:
 
         self.densify_and_split(grads, max_grad, extent)
         if stats is not None:
-            stats["n_after_split"] = self.get_xyz.shape[0]
+            with diagnostic_context():
+                stats["n_after_split"] = self.get_xyz.shape[0]
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if stats is not None:
-            stats["prune_opacity"] = self._count_mask(prune_mask)
-            stats["prune_big_vs"] = 0
-            stats["prune_big_ws"] = 0
+            with diagnostic_context():
+                stats["prune_opacity"] = self._count_mask(prune_mask)
+                stats["prune_big_vs"] = 0
+                stats["prune_big_ws"] = 0
 
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             if stats is not None:
-                stats["prune_big_vs"] = self._count_mask(big_points_vs)
-                stats["prune_big_ws"] = self._count_mask(big_points_ws)
+                with diagnostic_context():
+                    stats["prune_big_vs"] = self._count_mask(big_points_vs)
+                    stats["prune_big_ws"] = self._count_mask(big_points_ws)
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
 
         if stats is not None:
-            stats["prune_total"] = self._count_mask(prune_mask)
+            with diagnostic_context():
+                stats["prune_total"] = self._count_mask(prune_mask)
 
         self.prune_points(prune_mask)
         if stats is not None:
-            stats["n_after_regular_prune"] = self.get_xyz.shape[0]
+            with diagnostic_context():
+                stats["n_after_regular_prune"] = self.get_xyz.shape[0]
 
         post_budget_prune_mask = self._budget_prune_mask_by_opacity(max_gaussians)
-        post_budget_prune = self._count_mask(post_budget_prune_mask)
         if post_budget_prune_mask.any().item():
             self.prune_points(post_budget_prune_mask)
         if stats is not None:
-            stats["prune_budget"] += post_budget_prune
-            stats["prune_post_budget"] = post_budget_prune
+            with diagnostic_context():
+                post_budget_prune = self._count_mask(post_budget_prune_mask)
+                stats["prune_budget"] += post_budget_prune
+                stats["prune_post_budget"] = post_budget_prune
 
         if stats is not None:
-            stats["n_after_prune"] = self.get_xyz.shape[0]
-            self._print_densify_debug(stats)
+            with diagnostic_context():
+                stats["n_after_prune"] = self.get_xyz.shape[0]
+                self._print_densify_debug(stats)
         torch.cuda.empty_cache()
 
     @torch.no_grad()

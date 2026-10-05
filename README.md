@@ -86,6 +86,27 @@ Commandline arguments for regularizations
 **Tips for adjusting the parameters on your own dataset:**
 - For unbounded/large scenes, we suggest using mean depth, i.e., ``depth_ratio=0``,  for less "disk-aliasing" artifacts.
 
+The sonar training loop records `training_time_seconds` using elapsed CPU/GPU
+time, including data preparation within the loop, learning rate updates,
+forward/loss/backward, optimizer updates, parameter bounds, densification,
+pruning and opacity resets. Initialization, evaluation, geometry export,
+checkpoint capture/save, logs, HTML and GUI work are excluded. The training
+device is synchronized at the boundaries so asynchronous GPU work is assigned
+to the correct interval. CSV, TensorBoard, progress, GUI and time budgets use
+the same clock; the CUDA Event `iter_time` metric has been removed.
+
+Use `--stop_after_training_seconds 3000` (or `7000`) to stop at the first complete
+training group that reaches the budget, after its densification and opacity
+reset. The actual time may exceed the budget by one group. Set it to `0` to
+disable time stopping; `--iterations` remains an independent limit.
+Version 3 checkpoints preserve the clock. Legacy checkpoints start at zero for
+the resumed segment (`training_time_scope=since_resume`); incompatible or
+restarted loss histories are preserved under `loss_curves/archive_<id>/`.
+
+Timing checks: `python -m unittest discover -s tests -v`. In an environment with
+the compiled CUDA extensions, enable the real GPU smoke test with
+`RUN_TRAINING_TIME_GPU_TESTS=1 python -m unittest discover -s tests -p test_training_time_gpu.py -v`.
+
 ## Testing
 ### Bounded Mesh Extraction
 To export a mesh within a bounded volume, simply use

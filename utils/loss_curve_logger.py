@@ -1,6 +1,10 @@
 import csv
 import json
 import os
+import shutil
+import uuid
+
+from utils.training_clock import TIMING_POLICY_VERSION, TRAINING_TIME_SCOPES, validate_seconds
 
 
 IMAGE_LOSS_SERIES = (
@@ -48,7 +52,11 @@ def write_loss_curve_html_files(output_dir, rows):
     _write_html_file(dist_html_path, "Dist loss", rows, [REGULARIZATION_SERIES[2]], "Loss")
     _write_html_file(normal_html_path, "Normal loss", rows, [REGULARIZATION_SERIES[3]], "Loss")
     _write_html_file(gaussian_html_path, "Gaussian count", rows, GAUSSIAN_SERIES, "Gaussians")
-    _write_html_file(training_time_html_path, "Training time", rows, TRAINING_TIME_SERIES, "Training time (s)")
+    scope = rows[-1].get("training_time_scope") if rows else None
+    time_title = f"Training time ({scope})" if scope else "Training time"
+    if rows and not rows[-1].get("timing_policy_version"):
+        time_title += " (legacy timing)"
+    _write_html_file(training_time_html_path, time_title, rows, TRAINING_TIME_SERIES, "Training time (s)")
 
     return {
         "all": combined_html_path,
@@ -76,9 +84,21 @@ class LossCurveLogger:
         "normal_loss",
         "total_gaussians",
         "training_time_seconds",
+        "timing_policy_version",
+        "training_time_scope",
     )
 
-    def __init__(self, model_path, resume_from_iter=0, plot_interval=100):
+    def __init__(
+        self, model_path, resume_from_iter=0, plot_interval=100, *,
+        training_time_scope="full_training", resume_training_seconds=None,
+        legacy_resume=False,
+    ):
+        if training_time_scope not in TRAINING_TIME_SCOPES:
+            raise ValueError(f"Unsupported training time scope: {training_time_scope!r}")
+        self.training_time_scope = training_time_scope
+        self.resume_training_seconds = (
+            None if resume_training_seconds is None else validate_seconds(resume_training_seconds)
+        )
         self.output_dir = os.path.join(model_path, "loss_curves")
         self.csv_path = os.path.join(self.output_dir, "losses.csv")
         self.combined_html_path = os.path.join(self.output_dir, "loss_curves.html")
@@ -93,9 +113,14 @@ class LossCurveLogger:
         self.plot_interval = max(1, int(plot_interval))
         self.rows = []
         self._closed = False
+        self.archive_path = None
 
         os.makedirs(self.output_dir, exist_ok=True)
-        if resume_from_iter > 0:
+        if os.path.exists(self.csv_path) and (
+            legacy_resume or resume_from_iter == 0 or not self._compatible_history()
+        ):
+            self._archive_history()
+        elif resume_from_iter > 0:
             self.rows = self._load_rows_until(resume_from_iter)
 
         self._csv_file = open(self.csv_path, "w", newline="")
@@ -105,7 +130,32 @@ class LossCurveLogger:
             self._csv_writer.writerow(row)
         self._csv_file.flush()
 
-        self.write_html()
+        try:
+            self.write_html()
+        except BaseException:
+            self._csv_file.close()
+            self._closed = True
+            raise
+
+    def _compatible_history(self):
+        with open(self.csv_path, "r", newline="") as csv_file:
+            reader = csv.DictReader(csv_file)
+            if not {"timing_policy_version", "training_time_scope"}.issubset(reader.fieldnames or ()):
+                return False
+            return all(
+                row.get("timing_policy_version") == str(TIMING_POLICY_VERSION)
+                and row.get("training_time_scope") == self.training_time_scope
+                for row in reader
+            )
+
+    def _archive_history(self):
+        # Preserve the old files before overwriting; UUID prevents collisions.
+        self.archive_path = os.path.join(self.output_dir, "archive_" + uuid.uuid4().hex)
+        os.makedirs(self.archive_path)
+        for name in os.listdir(self.output_dir):
+            source = os.path.join(self.output_dir, name)
+            if os.path.isfile(source) and (name == "losses.csv" or name.endswith(".html")):
+                shutil.copy2(source, os.path.join(self.archive_path, name))
 
     def _load_rows_until(self, max_iteration):
         if not os.path.exists(self.csv_path):
@@ -119,6 +169,11 @@ class LossCurveLogger:
                     iteration = int(row["iteration"])
                     if iteration > max_iteration:
                         continue
+                    training_seconds = _optional_float(row.get("training_time_seconds"))
+                    if training_seconds is not None:
+                        validate_seconds(training_seconds)
+                        if self.resume_training_seconds is not None and training_seconds > self.resume_training_seconds:
+                            continue
                     image_loss = float(row["image_loss"])
                     total_loss = float(row["total_loss"])
                     rows.append(
@@ -138,19 +193,14 @@ class LossCurveLogger:
                             "dist_loss": _optional_float(row.get("dist_loss")),
                             "normal_loss": _optional_float(row.get("normal_loss")),
                             "total_gaussians": _optional_int(row.get("total_gaussians")),
-                            "training_time_seconds": _optional_float(row.get("training_time_seconds")),
+                            "training_time_seconds": training_seconds,
+                            "timing_policy_version": TIMING_POLICY_VERSION,
+                            "training_time_scope": self.training_time_scope,
                         }
                     )
                 except (KeyError, TypeError, ValueError):
                     continue
         return rows
-
-    def last_training_time_seconds(self):
-        for row in reversed(self.rows):
-            value = row.get("training_time_seconds")
-            if value not in (None, ""):
-                return float(value)
-        return 0.0
 
     def log(
         self,
@@ -181,7 +231,11 @@ class LossCurveLogger:
             "dist_loss": _optional_float(dist_loss),
             "normal_loss": _optional_float(normal_loss),
             "total_gaussians": _optional_int(total_gaussians),
-            "training_time_seconds": _optional_float(training_time_seconds),
+            "training_time_seconds": (
+                None if training_time_seconds is None else validate_seconds(training_time_seconds)
+            ),
+            "timing_policy_version": TIMING_POLICY_VERSION,
+            "training_time_scope": self.training_time_scope,
         }
         self.rows.append(row)
         self._csv_writer.writerow(row)
@@ -202,10 +256,12 @@ class LossCurveLogger:
         if self._closed:
             return
 
-        self._csv_file.flush()
-        self.write_html()
-        self._csv_file.close()
-        self._closed = True
+        try:
+            self._csv_file.flush()
+            self.write_html()
+        finally:
+            self._csv_file.close()
+            self._closed = True
 
 def _optional_int(value):
     if value in (None, ""):

@@ -7,6 +7,8 @@ from socketserver import TCPServer
 try:
     from utils.loss_curve_logger import write_loss_curve_html_files
 except ImportError:
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from loss_curve_logger import write_loss_curve_html_files
 
 
@@ -31,6 +33,9 @@ def read_loss_rows(csv_path):
                     "dist_loss": optional_float(row.get("dist_loss")),
                     "normal_loss": optional_float(row.get("normal_loss")),
                     "total_gaussians": int(float(total_gaussians)) if total_gaussians else None,
+                    "training_time_seconds": optional_float(row.get("training_time_seconds")),
+                    "timing_policy_version": row.get("timing_policy_version"),
+                    "training_time_scope": row.get("training_time_scope"),
                 }
             )
     return rows
@@ -74,6 +79,7 @@ def serve_html(loss_curve_dir, port):
         print(f"Dist loss: http://127.0.0.1:{port}/dist_loss.html")
         print(f"Normal loss: http://127.0.0.1:{port}/normal_loss.html")
         print(f"Gaussian count: http://127.0.0.1:{port}/gaussian_count.html")
+        print(f"Training time: http://127.0.0.1:{port}/training_time.html")
         print("Press Ctrl+C to stop the viewer.")
         server.serve_forever()
 
@@ -99,6 +105,7 @@ def main():
     print(f"Dist loss: {html_paths['dist']}")
     print(f"Normal loss: {html_paths['normal']}")
     print(f"Gaussian count: {html_paths['gaussians']}")
+    print(f"Training time: {html_paths['training_time']}")
 
     if args.serve:
         serve_html(loss_curve_dir, args.port)

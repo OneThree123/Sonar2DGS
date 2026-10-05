@@ -4,7 +4,6 @@ import uuid
 import atexit
 import math
 import random
-import time
 from argparse import ArgumentParser, Namespace
 
 import numpy as np
@@ -28,6 +27,9 @@ from utils.group_schedule import GroupTrainingSchedule
 from utils.image_utils import psnr, render_net_image
 from utils.intensity_diagnostics import format_raw_intensity_stats
 from utils.loss_curve_logger import LossCurveLogger
+from utils.training_clock import (
+    TIMING_POLICY_VERSION, TrainingClock, checkpoint_training_time, validate_seconds,
+)
 from utils.loss_utils import gaussian_blur, l1_loss, masked_l1_loss, masked_ssim, weighted_mean
 
 try:
@@ -144,15 +146,6 @@ def print_group_event_schedule(name, events, schedule):
             f"-> group {group} -> effective iteration "
             f"{schedule.group_end_iteration(group)}{merged}"
         )
-
-
-def adjust_progress_bar_elapsed(progress_bar, seconds):
-    if seconds <= 0:
-        return
-
-    for attr in ("start_t", "last_print_t"):
-        if hasattr(progress_bar, attr):
-            setattr(progress_bar, attr, getattr(progress_bar, attr) + seconds)
 
 
 def filter_small_connected_components(mask, min_component_size):
@@ -425,14 +418,9 @@ def get_anti_noise_settings(opt):
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, loss_curve_plot_interval=100):
-    stop_after_training_seconds = float(
-        getattr(opt, "stop_after_training_seconds", 0.0) or 0.0
+    stop_after_training_seconds = validate_seconds(
+        getattr(opt, "stop_after_training_seconds", 0.0), "stop_after_training_seconds"
     )
-    if stop_after_training_seconds < 0:
-        raise ValueError(
-            "stop_after_training_seconds must be non-negative, "
-            f"got {stop_after_training_seconds}"
-        )
 
     loss_intensity_mode = str(
         getattr(opt, "loss_intensity_mode", "normalized") or "normalized"
@@ -620,9 +608,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             flush=True,
         )
 
+    checkpoint_state = None
     if checkpoint:
         checkpoint_state = torch.load(checkpoint, weights_only=False)
-        if isinstance(checkpoint_state, dict) and checkpoint_state.get("version") == 2:
+        checkpoint_training_time(checkpoint_state)  # Reject unknown format/policy versions.
+        if isinstance(checkpoint_state, dict):
             model_params = checkpoint_state["gaussians"]
             first_iter = int(checkpoint_state["global_step"])
             completed_groups = int(checkpoint_state["completed_groups"])
@@ -650,18 +640,36 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             completed_groups = first_iter // group_schedule.group_size
             print(
                 "[Group schedule] Loaded a legacy checkpoint at complete group "
-                f"{completed_groups}; future checkpoints will use format version 2."
+                f"{completed_groups}; future checkpoints will use format version 3."
             )
         gaussians.restore(model_params, opt)
 
+    if completed_groups < 0:
+        raise ValueError("Checkpoint completed_groups must be non-negative")
     if completed_groups > group_schedule.total_groups:
         raise ValueError(
             f"Checkpoint already completed {completed_groups} groups, but the "
             f"current request contains only {group_schedule.total_groups} groups."
         )
 
-    loss_curve_logger = LossCurveLogger(scene.model_path, first_iter, loss_curve_plot_interval)
+    initial_training_seconds, training_time_scope = checkpoint_training_time(checkpoint_state)
+    legacy_resume = checkpoint_state is not None and (
+        not isinstance(checkpoint_state, dict) or checkpoint_state.get("version") == 2
+    )
+    if legacy_resume:
+        print(
+            "[Training time] Legacy checkpoint has no pure training time history; "
+            "starting at 0s (scope=since_resume). Any time budget applies to this resumed segment."
+        )
+    loss_curve_logger = LossCurveLogger(
+        scene.model_path, first_iter, loss_curve_plot_interval,
+        training_time_scope=training_time_scope,
+        resume_training_seconds=initial_training_seconds,
+        legacy_resume=legacy_resume,
+    )
     atexit.register(loss_curve_logger.close)
+    if loss_curve_logger.archive_path:
+        print(f"[Loss curves] Previous history archived to {loss_curve_logger.archive_path}")
     print(
         "[Loss curves] CSV: {}\n"
         "[Loss curves] HTML: {}, {}, {}, {}, {}, {}, {}, {}, {}".format(
@@ -678,9 +686,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
     )
 
-    iter_start = torch.cuda.Event(enable_timing=True)
-    iter_end = torch.cuda.Event(enable_timing=True)
-
     ema_loss_for_log = 0.0
     ema_dist_for_log = 0.0
     ema_normal_for_log = 0.0
@@ -690,10 +695,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         total=group_schedule.effective_iterations,
         initial=first_iter,
         desc="Training progress",
+        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}{postfix}",
     )
-    output_write_seconds = 0.0
-    training_timer_start = time.perf_counter()
-    training_time_offset = loss_curve_logger.last_training_time_seconds()
+    training_device = gaussians.get_xyz.device
+    training_clock = TrainingClock(
+        initial_training_seconds,
+        synchronize=lambda: torch.cuda.synchronize(training_device),
+    )
     if stop_after_training_seconds > 0:
         print(
             "[Timed stop] Will stop after the current complete group once training "
@@ -701,245 +709,239 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             flush=True,
         )
 
-    def exclude_output_write_time(seconds):
-        nonlocal output_write_seconds
-        output_write_seconds += seconds
-        adjust_progress_bar_elapsed(progress_bar, seconds)
-
-    def run_output_write(callback):
-        start = time.perf_counter()
-        try:
-            return callback()
-        finally:
-            exclude_output_write_time(time.perf_counter() - start)
-
-    def current_training_time_seconds():
-        elapsed = time.perf_counter() - training_timer_start - output_write_seconds
-        return max(0.0, training_time_offset + elapsed)
-
     global_step = first_iter
-    stop_requested = False
+    stop_requested = (
+        stop_after_training_seconds > 0
+        and initial_training_seconds >= stop_after_training_seconds
+    )
     last_densify_group = max(densify_events, default=0)
 
-    for group_idx in range(completed_groups + 1, group_schedule.total_groups + 1):
-        group_start_step = group_schedule.group_start_iteration(group_idx)
-        group_end_step = group_schedule.group_end_iteration(group_idx)
-        lowpass_variance = annealed_lowpass_variance(
-            group_start_step,
-            lowpass_s_init,
-            lowpass_s_final,
-            lowpass_anneal_from_iter,
-            lowpass_anneal_until_iter,
-        )
-        gaussian_limit = scheduled_max_gaussians(
-            group_end_step,
-            max_gaussians_initial,
-            max_gaussians_anneal_target,
-            max_gaussians_post_anneal,
-            max_gaussians_anneal_until_iter,
-        )
-        gaussians.update_learning_rate(group_start_step)
-
-        group_cameras = train_cameras.copy()
-        random.Random(group_idx).shuffle(group_cameras)
-        group_loss_sums = {
-            "intensity": 0.0,
-            "empty": 0.0,
-            "dist": 0.0,
-            "normal": 0.0,
-            "total": 0.0,
-        }
-        print(
-            f"\n[GROUP {group_idx}/{group_schedule.total_groups}] "
-            f"iterations {group_start_step + 1}-{group_end_step}, "
-            f"cameras={len(group_cameras)}"
-        )
-
-        for sample_idx, viewpoint_cam in enumerate(group_cameras, start=1):
-            global_step += 1
-            iteration = global_step
-            is_group_end = sample_idx == group_schedule.group_size
-            iter_start.record()
-
-            render_pkg = render(
-                viewpoint_cam,
-                gaussians,
-                pipe,
-                lowpass_variance=lowpass_variance,
-            )
-            render_intensity = render_pkg["raw_intensity"]
-            screenspace_points = render_pkg["screenspace_points"]
-            gs_visibility = render_pkg["gs_visibility"]
-            gs_raddi = render_pkg["gs_raddi"]
-
-            gt_source = (
-                getattr(viewpoint_cam, "anti_noise_image", viewpoint_cam.original_image)
-                if anti_noise_enabled
-                else viewpoint_cam.original_image
-            )
-            gt_image = gt_source.to(render_intensity.device)
-            foreground_mask = viewpoint_cam.gt_alpha_mask
-            if foreground_mask is None:
-                foreground_mask = torch.ones_like(gt_image)
-            else:
-                foreground_mask = torch.clamp(
-                    foreground_mask.to(render_intensity.device), 0.0, 1.0
+    termination_reason = "training_budget" if stop_requested else "iteration_limit"
+    if stop_requested:
+        print("[Timed stop] Restored training time already reaches the budget; no new group will run.")
+    try:
+        for group_idx in range(completed_groups + 1, group_schedule.total_groups + 1):
+            if stop_requested:
+                break
+            with training_clock.training_region():
+                group_start_step = group_schedule.group_start_iteration(group_idx)
+                group_end_step = group_schedule.group_end_iteration(group_idx)
+                lowpass_variance = annealed_lowpass_variance(
+                    group_start_step,
+                    lowpass_s_init,
+                    lowpass_s_final,
+                    lowpass_anneal_from_iter,
+                    lowpass_anneal_until_iter,
                 )
-
-            loss_intensity, _ = prepare_sonar_intensity_for_loss(
-                render_intensity,
-                gt_image,
-                foreground_mask,
-                method=getattr(viewpoint_cam, "normalizing_method", "all"),
-                loss_mode=loss_intensity_mode,
-            )
-
-            Ll1 = masked_l1_loss(loss_intensity, gt_image, foreground_mask)
-            ssim_loss_intensity = loss_intensity
-            ssim_gt_image = gt_image
-            if anti_noise_enabled:
-                ssim_loss_intensity = gaussian_blur(
-                    loss_intensity, window_size=3, sigma=1.0
+                gaussian_limit = scheduled_max_gaussians(
+                    group_end_step,
+                    max_gaussians_initial,
+                    max_gaussians_anneal_target,
+                    max_gaussians_post_anneal,
+                    max_gaussians_anneal_until_iter,
                 )
-                ssim_gt_image = gaussian_blur(
-                    gt_image, window_size=3, sigma=1.0
-                )
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (
-                1.0
-                - masked_ssim(
-                    ssim_loss_intensity,
-                    ssim_gt_image,
-                    foreground_mask,
-                )
+                gaussians.update_learning_rate(group_start_step)
+
+                group_cameras = train_cameras.copy()
+                random.Random(group_idx).shuffle(group_cameras)
+            group_loss_sums = {
+                "intensity": 0.0,
+                "empty": 0.0,
+                "dist": 0.0,
+                "normal": 0.0,
+                "total": 0.0,
+            }
+            print(
+                f"\n[GROUP {group_idx}/{group_schedule.total_groups}] "
+                f"iterations {group_start_step + 1}-{group_end_step}, "
+                f"cameras={len(group_cameras)}"
             )
 
-            background_weight = (1.0 - foreground_mask).pow(2)
-            empty_loss = opt.lambda_empty * weighted_mean(
-                loss_intensity.pow(2), background_weight
-            )
+            for sample_idx, viewpoint_cam in enumerate(group_cameras, start=1):
+                with training_clock.training_region():
+                    global_step += 1
+                    iteration = global_step
+                    is_group_end = sample_idx == group_schedule.group_size
 
-            lambda_normal = (
-                opt.lambda_normal
-                if group_start_step >= regularization_from_iter
-                else 0.0
-            )
-            lambda_dist = (
-                opt.lambda_dist
-                if group_start_step >= regularization_from_iter
-                else 0.0
-            )
-
-            rend_dist = render_pkg["rend_dist"]
-            rend_alpha = render_pkg["rend_alpha"]
-            rend_normal = render_pkg["rend_normal"]
-            surf_normal = render_pkg["surf_normal"]
-            surf_normal_mask = render_pkg["surf_normal_mask"].to(
-                dtype=rend_alpha.dtype
-            )
-
-            normal_error = rend_alpha.detach() - (
-                rend_normal * surf_normal
-            ).sum(dim=0, keepdim=True)
-            normal_loss = lambda_normal * weighted_mean(
-                normal_error, surf_normal_mask
-            )
-            dist_mask = (rend_alpha.detach() > 0.1).to(dtype=rend_dist.dtype)
-            dist_loss = lambda_dist * weighted_mean(rend_dist, dist_mask)
-
-            total_loss = loss + empty_loss + dist_loss + normal_loss
-            total_loss.backward()
-            iter_end.record()
-
-            with torch.no_grad():
-                image_loss_value = loss.item()
-                empty_loss_value = empty_loss.item()
-                dist_loss_value = dist_loss.item()
-                normal_loss_value = normal_loss.item()
-                total_loss_value = total_loss.item()
-
-                group_loss_sums["intensity"] += image_loss_value
-                group_loss_sums["empty"] += empty_loss_value
-                group_loss_sums["dist"] += dist_loss_value
-                group_loss_sums["normal"] += normal_loss_value
-                group_loss_sums["total"] += total_loss_value
-
-                ema_loss_for_log = 0.4 * image_loss_value + 0.6 * ema_loss_for_log
-                ema_empty_for_log = (
-                    0.4 * empty_loss_value + 0.6 * ema_empty_for_log
-                )
-                ema_dist_for_log = 0.4 * dist_loss_value + 0.6 * ema_dist_for_log
-                ema_normal_for_log = (
-                    0.4 * normal_loss_value + 0.6 * ema_normal_for_log
-                )
-
-                if group_idx <= last_densify_group:
-                    gaussians.max_radii2D[gs_visibility] = torch.max(
-                        gaussians.max_radii2D[gs_visibility],
-                        gs_raddi[gs_visibility],
+                    render_pkg = render(
+                        viewpoint_cam,
+                        gaussians,
+                        pipe,
+                        lowpass_variance=lowpass_variance,
                     )
-                    gaussians.add_densification_stats(
-                        screenspace_points,
-                        gs_visibility,
-                        gaussians.get_xyz.grad,
+                    render_intensity = render_pkg["raw_intensity"]
+                    screenspace_points = render_pkg["screenspace_points"]
+                    gs_visibility = render_pkg["gs_visibility"]
+                    gs_raddi = render_pkg["gs_raddi"]
+
+                    gt_source = (
+                        getattr(viewpoint_cam, "anti_noise_image", viewpoint_cam.original_image)
+                        if anti_noise_enabled
+                        else viewpoint_cam.original_image
+                    )
+                    gt_image = gt_source.to(render_intensity.device)
+                    foreground_mask = viewpoint_cam.gt_alpha_mask
+                    if foreground_mask is None:
+                        foreground_mask = torch.ones_like(gt_image)
+                    else:
+                        foreground_mask = torch.clamp(
+                            foreground_mask.to(render_intensity.device), 0.0, 1.0
+                        )
+
+                    loss_intensity, _ = prepare_sonar_intensity_for_loss(
+                        render_intensity,
+                        gt_image,
+                        foreground_mask,
+                        method=getattr(viewpoint_cam, "normalizing_method", "all"),
+                        loss_mode=loss_intensity_mode,
                     )
 
-                gaussians.optimizer.step()
-                gaussians.enforce_parameter_bounds()
-                gaussians.optimizer.zero_grad(set_to_none=True)
-
-                progress_bar.update(1)
-                training_time_seconds = current_training_time_seconds()
-                if (
-                    not stop_requested
-                    and stop_after_training_seconds > 0
-                    and training_time_seconds >= stop_after_training_seconds
-                ):
-                    stop_requested = True
-                    print(
-                        "\n[ITER {}] Training time reached {:.2f}s; "
-                        "finishing group {} before forced output and stop.".format(
-                            iteration,
-                            training_time_seconds,
-                            group_idx,
+                    Ll1 = masked_l1_loss(loss_intensity, gt_image, foreground_mask)
+                    ssim_loss_intensity = loss_intensity
+                    ssim_gt_image = gt_image
+                    if anti_noise_enabled:
+                        ssim_loss_intensity = gaussian_blur(
+                            loss_intensity, window_size=3, sigma=1.0
+                        )
+                        ssim_gt_image = gaussian_blur(
+                            gt_image, window_size=3, sigma=1.0
+                        )
+                    loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (
+                        1.0
+                        - masked_ssim(
+                            ssim_loss_intensity,
+                            ssim_gt_image,
+                            foreground_mask,
                         )
                     )
 
-                if is_group_end and group_idx in densify_events:
-                    requested = densify_events[group_idx]
-                    print(
-                        f"\n[GROUP {group_idx}] Densifying at effective iteration "
-                        f"{group_end_step}; requested iteration(s) {requested}"
+                    background_weight = (1.0 - foreground_mask).pow(2)
+                    empty_loss = opt.lambda_empty * weighted_mean(
+                        loss_intensity.pow(2), background_weight
                     )
-                    size_threshold = (
-                        3200
-                        if (
-                            opacity_size_threshold_step is not None
-                            and group_end_step > opacity_size_threshold_step
+
+                    lambda_normal = (
+                        opt.lambda_normal
+                        if group_start_step >= regularization_from_iter
+                        else 0.0
+                    )
+                    lambda_dist = (
+                        opt.lambda_dist
+                        if group_start_step >= regularization_from_iter
+                        else 0.0
+                    )
+
+                    rend_dist = render_pkg["rend_dist"]
+                    rend_alpha = render_pkg["rend_alpha"]
+                    rend_normal = render_pkg["rend_normal"]
+                    surf_normal = render_pkg["surf_normal"]
+                    surf_normal_mask = render_pkg["surf_normal_mask"].to(
+                        dtype=rend_alpha.dtype
+                    )
+
+                    normal_error = rend_alpha.detach() - (
+                        rend_normal * surf_normal
+                    ).sum(dim=0, keepdim=True)
+                    normal_loss = lambda_normal * weighted_mean(
+                        normal_error, surf_normal_mask
+                    )
+                    dist_mask = (rend_alpha.detach() > 0.1).to(dtype=rend_dist.dtype)
+                    dist_loss = lambda_dist * weighted_mean(rend_dist, dist_mask)
+
+                    total_loss = loss + empty_loss + dist_loss + normal_loss
+                    total_loss.backward()
+
+                    with torch.no_grad():
+                        if group_idx <= last_densify_group:
+                            gaussians.max_radii2D[gs_visibility] = torch.max(
+                                gaussians.max_radii2D[gs_visibility],
+                                gs_raddi[gs_visibility],
+                            )
+                            gaussians.add_densification_stats(
+                                screenspace_points,
+                                gs_visibility,
+                                gaussians.get_xyz.grad,
+                            )
+
+                        gaussians.optimizer.step()
+                        gaussians.enforce_parameter_bounds()
+                        gaussians.optimizer.zero_grad(set_to_none=True)
+
+                        if is_group_end and group_idx in densify_events:
+                            size_threshold = (
+                                3200
+                                if (
+                                    opacity_size_threshold_step is not None
+                                    and group_end_step > opacity_size_threshold_step
+                                )
+                                else None
+                            )
+                            gaussians.densify_and_prune(
+                                opt.densify_grad_threshold,
+                                opt.opacity_cull,
+                                scene.cameras_extent,
+                                size_threshold,
+                                max_gaussians=gaussian_limit,
+                                debug=getattr(opt, "densify_debug", False),
+                                iteration=group_end_step,
+                                diagnostic_context=training_clock.excluded_region,
+                            )
+
+                        if is_group_end and group_idx in opacity_reset_events:
+                            gaussians.reset_opacity(opt.opacity_reset_value)
+
+                with training_clock.excluded_region(), torch.no_grad():
+                    training_time_seconds = training_clock.snapshot_seconds()
+                    if is_group_end:
+                        completed_groups = group_idx
+                    if (
+                        is_group_end
+                        and stop_after_training_seconds > 0
+                        and training_time_seconds >= stop_after_training_seconds
+                    ):
+                        stop_requested = True
+                        termination_reason = "training_budget"
+                        print(
+                            f"\n[ITER {iteration}] Training time reached {training_time_seconds:.2f}s; "
+                            f"group {group_idx} complete, saving outputs before stop."
                         )
-                        else None
+                    progress_bar.update(1)
+                    image_loss_value = loss.item()
+                    empty_loss_value = empty_loss.item()
+                    dist_loss_value = dist_loss.item()
+                    normal_loss_value = normal_loss.item()
+                    total_loss_value = total_loss.item()
+
+                    group_loss_sums["intensity"] += image_loss_value
+                    group_loss_sums["empty"] += empty_loss_value
+                    group_loss_sums["dist"] += dist_loss_value
+                    group_loss_sums["normal"] += normal_loss_value
+                    group_loss_sums["total"] += total_loss_value
+
+                    ema_loss_for_log = 0.4 * image_loss_value + 0.6 * ema_loss_for_log
+                    ema_empty_for_log = (
+                        0.4 * empty_loss_value + 0.6 * ema_empty_for_log
                     )
-                    gaussians.densify_and_prune(
-                        opt.densify_grad_threshold,
-                        opt.opacity_cull,
-                        scene.cameras_extent,
-                        size_threshold,
-                        max_gaussians=gaussian_limit,
-                        debug=getattr(opt, "densify_debug", False),
-                        iteration=group_end_step,
+                    ema_dist_for_log = 0.4 * dist_loss_value + 0.6 * ema_dist_for_log
+                    ema_normal_for_log = (
+                        0.4 * normal_loss_value + 0.6 * ema_normal_for_log
                     )
 
-                if is_group_end and group_idx in opacity_reset_events:
-                    requested = opacity_reset_events[group_idx]
-                    print(
-                        f"\n[GROUP {group_idx}] Resetting opacity at effective "
-                        f"iteration {group_end_step}; requested iteration(s) "
-                        f"{requested}"
-                    )
-                    gaussians.reset_opacity(opt.opacity_reset_value)
-
-                total_gaussians = get_total_gaussians(gaussians)
-                run_output_write(
-                    lambda: loss_curve_logger.log(
+                    if is_group_end and group_idx in densify_events:
+                        requested = densify_events[group_idx]
+                        print(
+                            f"\n[GROUP {group_idx}] Densified at effective iteration "
+                            f"{group_end_step}; requested iteration(s) {requested}"
+                        )
+                    if is_group_end and group_idx in opacity_reset_events:
+                        requested = opacity_reset_events[group_idx]
+                        print(
+                            f"\n[GROUP {group_idx}] Reset opacity at effective "
+                            f"iteration {group_end_step}; requested iteration(s) "
+                            f"{requested}"
+                        )
+                    total_gaussians = get_total_gaussians(gaussians)
+                    loss_curve_logger.log(
                         iteration,
                         image_loss_value,
                         total_loss_value,
@@ -954,207 +956,225 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             is_group_end and group_idx in loss_curve_events
                         ),
                     )
-                )
 
-                if tb_writer is not None:
-                    tb_writer.add_scalar(
-                        "train_loss/intensity", image_loss_value, iteration
-                    )
-                    tb_writer.add_scalar(
-                        "train_loss/empty", empty_loss_value, iteration
-                    )
-                    tb_writer.add_scalar(
-                        "train_loss/dist", dist_loss_value, iteration
-                    )
-                    tb_writer.add_scalar(
-                        "train_loss/normal", normal_loss_value, iteration
-                    )
-                    tb_writer.add_scalar(
-                        "train_loss/total", total_loss_value, iteration
-                    )
-                    tb_writer.add_scalar(
-                        "iter_time",
-                        iter_start.elapsed_time(iter_end),
-                        iteration,
-                    )
-                    tb_writer.add_scalar(
-                        "total_gaussians", total_gaussians, iteration
-                    )
-                    tb_writer.add_scalar(
-                        "total_points", total_gaussians, iteration
-                    )
-
-                if iteration % 10 == 0 or is_group_end:
-                    progress_bar.set_postfix({
-                        "Group": f"{group_idx}/{group_schedule.total_groups}",
-                        "Loss": f"{ema_loss_for_log:.5f}",
-                        "empty": f"{ema_empty_for_log:.5f}",
-                        "distort": f"{ema_dist_for_log:.5f}",
-                        "normal": f"{ema_normal_for_log:.5f}",
-                        "Gaussians": f"{total_gaussians}",
-                        "GS limit": f"{gaussian_limit}",
-                        "LP s": f"{lowpass_variance:.3f}",
-                    })
-
-                if is_group_end:
-                    group_means = {
-                        key: value / group_schedule.group_size
-                        for key, value in group_loss_sums.items()
-                    }
-                    print(
-                        "\n[GROUP {}] Complete at iteration {}: "
-                        "mean intensity={:.6f}, mean total={:.6f}, "
-                        "Gaussians={}".format(
-                            group_idx,
-                            group_end_step,
-                            group_means["intensity"],
-                            group_means["total"],
-                            total_gaussians,
-                        )
-                    )
                     if tb_writer is not None:
-                        for name, value in group_means.items():
+                        tb_writer.add_scalar(
+                            "train_loss/intensity", image_loss_value, iteration
+                        )
+                        tb_writer.add_scalar(
+                            "train_loss/empty", empty_loss_value, iteration
+                        )
+                        tb_writer.add_scalar(
+                            "train_loss/dist", dist_loss_value, iteration
+                        )
+                        tb_writer.add_scalar(
+                            "train_loss/normal", normal_loss_value, iteration
+                        )
+                        tb_writer.add_scalar(
+                            "train_loss/total", total_loss_value, iteration
+                        )
+                        tb_writer.add_scalar(
+                            "train/training_time_seconds",
+                            training_time_seconds,
+                            iteration,
+                        )
+                        tb_writer.add_scalar(
+                            "total_gaussians", total_gaussians, iteration
+                        )
+                        tb_writer.add_scalar(
+                            "total_points", total_gaussians, iteration
+                        )
+
+                    if iteration % 10 == 0 or is_group_end:
+                        progress_bar.set_postfix({
+                            "Group": f"{group_idx}/{group_schedule.total_groups}",
+                            "Training time": f"{training_time_seconds:.2f}s",
+                            "Loss": f"{ema_loss_for_log:.5f}",
+                            "empty": f"{ema_empty_for_log:.5f}",
+                            "distort": f"{ema_dist_for_log:.5f}",
+                            "normal": f"{ema_normal_for_log:.5f}",
+                            "Gaussians": f"{total_gaussians}",
+                            "GS limit": f"{gaussian_limit}",
+                            "LP s": f"{lowpass_variance:.3f}",
+                        })
+
+                    if is_group_end:
+                        group_means = {
+                            key: value / group_schedule.group_size
+                            for key, value in group_loss_sums.items()
+                        }
+                        print(
+                            "\n[GROUP {}] Complete at iteration {}: "
+                            "mean intensity={:.6f}, mean total={:.6f}, "
+                            "Gaussians={}".format(
+                                group_idx,
+                                group_end_step,
+                                group_means["intensity"],
+                                group_means["total"],
+                                total_gaussians,
+                            )
+                        )
+                        if tb_writer is not None:
+                            for name, value in group_means.items():
+                                tb_writer.add_scalar(
+                                    f"group_loss/{name}",
+                                    value,
+                                    group_idx,
+                                )
                             tb_writer.add_scalar(
-                                f"group_loss/{name}",
-                                value,
+                                "group/effective_iteration",
+                                group_end_step,
                                 group_idx,
                             )
-                        tb_writer.add_scalar(
-                            "group/effective_iteration",
+                            tb_writer.add_scalar(
+                                "group/total_gaussians",
+                                total_gaussians,
+                                group_idx,
+                            )
+
+                        training_report(
+                            tb_writer,
                             group_end_step,
-                            group_idx,
-                        )
-                        tb_writer.add_scalar(
-                            "group/total_gaussians",
-                            total_gaussians,
-                            group_idx,
-                        )
-
-                    training_report(
-                        tb_writer,
-                        group_end_step,
-                        effective_testing_iterations,
-                        scene,
-                        render,
-                        (pipe, 1.0, lowpass_variance),
-                        log_intensity_stats=getattr(
-                            pipe, "intensity_stats", False
-                        ),
-                        record_output_write_time=exclude_output_write_time,
-                        force=stop_requested,
-                        anti_noise_enabled=anti_noise_enabled,
-                    )
-
-                    if (
-                        group_end_step in effective_saving_iterations
-                        or stop_requested
-                    ):
-                        print(
-                            f"\n[GROUP {group_idx} / ITER {group_end_step}] "
-                            "Saving Gaussians"
-                        )
-                        run_output_write(lambda: scene.save(group_end_step))
-
-                    if (
-                        group_end_step in effective_checkpoint_iterations
-                        or stop_requested
-                    ):
-                        print(
-                            f"\n[GROUP {group_idx} / ITER {group_end_step}] "
-                            "Saving Checkpoint"
-                        )
-                        checkpoint_path = os.path.join(
-                            scene.model_path,
-                            "chkpnt" + str(group_end_step) + ".pth",
-                        )
-                        checkpoint_state = {
-                            "version": 2,
-                            "gaussians": gaussians.capture(),
-                            "completed_groups": group_idx,
-                            "global_step": group_end_step,
-                            "group_size": group_schedule.group_size,
-                            "requested_iterations": group_schedule.requested_iterations,
-                            "effective_iterations": group_schedule.effective_iterations,
-                        }
-                        run_output_write(
-                            lambda: torch.save(
-                                checkpoint_state,
-                                checkpoint_path,
-                            )
+                            effective_testing_iterations,
+                            scene,
+                            render,
+                            (pipe, 1.0, lowpass_variance),
+                            log_intensity_stats=getattr(
+                                pipe, "intensity_stats", False
+                            ),
+                            force=stop_requested,
+                            anti_noise_enabled=anti_noise_enabled,
                         )
 
-            with torch.no_grad():
-                if network_gui.conn is None:
-                    network_gui.try_connect(dataset.render_items)
-                while network_gui.conn is not None:
-                    try:
-                        net_image_bytes = None
-                        (
-                            custom_cam,
-                            do_training,
-                            keep_alive,
-                            scaling_modifier,
-                            render_mode,
-                        ) = network_gui.receive()
-                        if custom_cam is not None:
-                            render_pkg = render(
-                                custom_cam,
-                                gaussians,
-                                pipe,
-                                scaling_modifier,
-                                lowpass_variance,
-                            )
-                            render_pkg = normalize_render_intensity_for_output(
-                                render_pkg, custom_cam
-                            )
-                            net_image = render_net_image(
-                                render_pkg,
-                                dataset.render_items,
-                                render_mode,
-                                custom_cam,
-                            )
-                            net_image_bytes = memoryview(
-                                (torch.clamp(net_image, min=0, max=1.0) * 255)
-                                .byte()
-                                .permute(1, 2, 0)
-                                .contiguous()
-                                .cpu()
-                                .numpy()
-                            )
-                        total_gaussians = get_total_gaussians(gaussians)
-                        metrics_dict = {
-                            "#": total_gaussians,
-                            "loss": ema_loss_for_log,
-                            "empty": ema_empty_for_log,
-                            "Gaussians": total_gaussians,
-                            "Group": group_idx,
-                        }
-                        network_gui.send(
-                            net_image_bytes,
-                            dataset.source_path,
-                            metrics_dict,
-                        )
-                        if do_training and (
-                            global_step < group_schedule.effective_iterations
-                            or not keep_alive
+                        if (
+                            group_end_step in effective_saving_iterations
+                            or stop_requested
                         ):
-                            break
-                    except Exception:
-                        network_gui.conn = None
+                            print(
+                                f"\n[GROUP {group_idx} / ITER {group_end_step}] "
+                                "Saving Gaussians"
+                            )
+                            scene.save(group_end_step)
 
-        if stop_requested:
-            print(
-                f"\n[Timed stop] Stopped after completing group {group_idx} "
-                f"at iteration {group_end_step}."
-            )
-            break
+                        if (
+                            group_end_step in effective_checkpoint_iterations
+                            or stop_requested
+                        ):
+                            print(
+                                f"\n[GROUP {group_idx} / ITER {group_end_step}] "
+                                "Saving Checkpoint"
+                            )
+                            checkpoint_path = os.path.join(
+                                scene.model_path,
+                                "chkpnt" + str(group_end_step) + ".pth",
+                            )
+                            checkpoint_state = {
+                                "version": 3,
+                                "training_time_seconds": training_time_seconds,
+                                "timing_policy_version": TIMING_POLICY_VERSION,
+                                "training_time_scope": training_time_scope,
+                                "gaussians": gaussians.capture(),
+                                "completed_groups": group_idx,
+                                "global_step": group_end_step,
+                                "group_size": group_schedule.group_size,
+                                "requested_iterations": group_schedule.requested_iterations,
+                                "effective_iterations": group_schedule.effective_iterations,
+                            }
+                            torch.save(checkpoint_state, checkpoint_path)
 
-    progress_bar.close()
+                    if not stop_requested:
+                        if network_gui.conn is None:
+                            network_gui.try_connect(dataset.render_items)
+                        while network_gui.conn is not None:
+                            try:
+                                net_image_bytes = None
+                                (
+                                    custom_cam,
+                                    do_training,
+                                    keep_alive,
+                                    scaling_modifier,
+                                    render_mode,
+                                ) = network_gui.receive()
+                                if custom_cam is not None:
+                                    render_pkg = render(
+                                        custom_cam,
+                                        gaussians,
+                                        pipe,
+                                        scaling_modifier,
+                                        lowpass_variance,
+                                    )
+                                    render_pkg = normalize_render_intensity_for_output(
+                                        render_pkg, custom_cam
+                                    )
+                                    net_image = render_net_image(
+                                        render_pkg,
+                                        dataset.render_items,
+                                        render_mode,
+                                        custom_cam,
+                                    )
+                                    net_image_bytes = memoryview(
+                                        (torch.clamp(net_image, min=0, max=1.0) * 255)
+                                        .byte()
+                                        .permute(1, 2, 0)
+                                        .contiguous()
+                                        .cpu()
+                                        .numpy()
+                                    )
+                                total_gaussians = get_total_gaussians(gaussians)
+                                metrics_dict = {
+                                    "#": total_gaussians,
+                                    "loss": ema_loss_for_log,
+                                    "empty": ema_empty_for_log,
+                                    "Gaussians": total_gaussians,
+                                    "Group": group_idx,
+                                    "training_time_seconds": training_time_seconds,
+                                }
+                                network_gui.send(
+                                    net_image_bytes,
+                                    dataset.source_path,
+                                    metrics_dict,
+                                )
+                                if do_training and (
+                                    global_step < group_schedule.effective_iterations
+                                    or not keep_alive
+                                ):
+                                    break
+                            except Exception:
+                                network_gui.conn = None
 
-    loss_curve_logger.close()
-    if tb_writer is not None:
-        tb_writer.flush()
-        tb_writer.close()
+            if stop_requested:
+                print(
+                    f"\n[Timed stop] Stopped after completing group {group_idx} "
+                    f"at iteration {group_end_step}."
+                )
+                break
+    except KeyboardInterrupt:
+        termination_reason = "interrupted"
+        raise
+    except BaseException:
+        termination_reason = "error"
+        raise
+    finally:
+        final_training_seconds = training_clock.finish()
+        print(
+            f"\n[Training time] {final_training_seconds:.6f}s "
+            f"(scope={training_time_scope}, policy={TIMING_POLICY_VERSION}); "
+            f"completed groups={completed_groups}, iteration={global_step}, "
+            f"termination_reason={termination_reason}"
+        )
+        try:
+            progress_bar.close()
+        finally:
+            try:
+                loss_curve_logger.close()
+            finally:
+                atexit.unregister(loss_curve_logger.close)
+                if tb_writer is not None:
+                    try:
+                        tb_writer.flush()
+                    finally:
+                        tb_writer.close()
+
 
 def save_tensor_image(image, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1233,7 +1253,6 @@ def training_report(
     render_func,
     render_args,
     log_intensity_stats=False,
-    record_output_write_time=None,
     force=False,
     anti_noise_enabled=False,
 ):
@@ -1271,10 +1290,7 @@ def training_report(
                     "renders",
                     "{:05d}_{}.png".format(idx, viewpoint.image_name),
                 )
-                save_start = time.perf_counter()
                 save_tensor_image(image, render_path)
-                if record_output_write_time is not None:
-                    record_output_write_time(time.perf_counter() - save_start)
 
                 gt_path = os.path.join(
                     scene.model_path,
@@ -1283,10 +1299,7 @@ def training_report(
                     "ground_truth",
                     "{:05d}_{}.png".format(idx, viewpoint.image_name),
                 )
-                save_start = time.perf_counter()
                 save_tensor_image(gt_image, gt_path)
-                if record_output_write_time is not None:
-                    record_output_write_time(time.perf_counter() - save_start)
 
                 if anti_noise_enabled and hasattr(viewpoint, "anti_noise_image"):
                     anti_noise_gt = viewpoint.anti_noise_image.to("cuda")
@@ -1297,10 +1310,7 @@ def training_report(
                         "ground_truth_anti_noise",
                         "{:05d}_{}.png".format(idx, viewpoint.image_name),
                     )
-                    save_start = time.perf_counter()
                     save_tensor_image(anti_noise_gt, anti_noise_gt_path)
-                    if record_output_write_time is not None:
-                        record_output_write_time(time.perf_counter() - save_start)
 
             if tb_writer and idx < 5:
                 tb_writer.add_images(config["name"] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)

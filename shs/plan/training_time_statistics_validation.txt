@@ -1,0 +1,38 @@
+任务 1 实施与验证记录
+日期：2026-10-05
+
+已实施：
+  - 新增 utils/training_clock.py，只累计显式训练区间的实际经过时间。
+  - train.py 删除 CUDA Event 和“总耗时减部分写入耗时”逻辑。
+  - 完整训练步骤及组末增密/剪枝/重置后同步训练设备，再冻结累计值。
+  - 测试、日志、HTML、保存/capture、几何导出和 GUI 全部在暂停区间。
+  - scene/gaussian_model.py 的增密 debug 专用统计/输出支持独立排除上下文。
+  - CSV、TensorBoard、进度条、GUI、检查点和预算共用同一时钟快照。
+  - v3 检查点恢复纯训练时间；v2/tuple 从续训段 0 秒计时并标记 since_resume。
+  - 旧或重新开始的曲线日志先归档，新口径曲线不混入旧口径时间。
+  - 正常、异常和 KeyboardInterrupt 收尾冻结训练时间并关闭输出。
+
+验证结果：
+  - 32 项测试：31 项通过，1 项真实 GPU 烟测默认按需启用而跳过。
+  - 假时钟验证训练 GPU 等待计入、非训练 GPU 等待排除、嵌套及异常状态。
+  - CPU 集成测试执行 train.py 中的实际 training()，使用 CPU 自动求导及可控时间回调，
+    不加载 CUDA 扩展。非训练延迟放大 100 倍，累计训练时间仍为相同值。
+  - 预算只在组末增密/重置阶段跨过时，完成该组后停止。
+  - 新检查点连续累计、已达到预算不启动新组、v2/tuple 兼容及旧日志归档通过。
+  - Python 语法检查、git diff --check 通过。
+  - AST 对比确认训练前向、损失与反向表达式未改变。
+
+本机 CPU 测试命令：
+  CUDA_VISIBLE_DEVICES='' LD_LIBRARY_PATH=/home/onethree/miniconda3/envs/surfel_splatting/lib /home/onethree/miniconda3/envs/surfel_splatting/bin/python -m unittest discover -s tests -v
+
+GPU 验证限制：
+  - 已主动尝试真实 GPU 烟测，但尚未进入训练：torch.cuda.is_available() 返回 False。
+  - 独立直接调用 NVIDIA Driver API 的 cuInit(0) 返回 3 / CUDA_ERROR_NOT_INITIALIZED。
+    nvidia-smi 能识别 RTX 5070 Ti，但当前不能启动 CUDA 计算。
+  - 本轮没有重置 GPU、修改驱动或重启系统。
+  - 已保留 tests/test_training_time_gpu.py。驱动恢复后可执行：
+    RUN_TRAINING_TIME_GPU_TESTS=1 LD_LIBRARY_PATH=/home/onethree/miniconda3/envs/surfel_splatting/lib /home/onethree/miniconda3/envs/surfel_splatting/bin/python -m unittest discover -s tests -p test_training_time_gpu.py -v
+  - 该烟测使用临时合成数据，覆盖真实训练、增密 debug、测试渲染、几何保存、capture、HTML、
+    极短预算、新检查点恢复及已达到预算跳过训练；输出在临时目录，结束自动清理。
+
+未实施：后续 PSNR/P2S 时间节点、质量日志和质量—时间曲线。这些继续复用当前组末训练快照。

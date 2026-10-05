@@ -1,8 +1,10 @@
 conda activate surfel_splatting
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-
 
 rm -rf build *.egg-info sonar_rasterization/_C*.so
-python -m pip install . --no-build-isolation --no-deps --force-reinstall --no-cache-dir
 
-conda deactivate
+export CUDA_HOME=/usr/local/cuda-12.9
+export TORCH_CUDA_ARCH_LIST="12.0"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+python -m pip install . \
+  --no-build-isolation --no-deps --force-reinstall --no-cache-dir

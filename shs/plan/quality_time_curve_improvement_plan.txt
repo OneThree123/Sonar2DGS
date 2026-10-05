@@ -1,0 +1,230 @@
+训练时间统一与质量—时间曲线改进规划
+日期：2026-10-04
+项目：/home/onethree/ws/2d-gaussian-splatting
+状态：规划文件；以下步骤尚未实施。
+
+一、最终目标与统一约定
+
+1. 只累计训练耗时。测试渲染、PSNR/P2S 计算、几何导出、模型与检查点保存、日志、HTML 绘图及 GUI 交互不计入训练时间。
+2. 训练耗时包含训练数据准备、学习率更新、训练前向、损失计算、反向、优化器更新、参数约束、增密/剪枝和透明度重置。这里统计实际训练过程的 CPU/GPU 耗时，不是单纯 CUDA kernel 时间。
+3. 初始化、数据集加载、GT 加载和恢复检查点不计入训练时间。另行记录 wall_seconds，反映本次运行实际经过的时间。
+4. 到达目标训练时间后，在第一个完整训练组结束时立即顺序评估：测试集平均 PSNR → 当前模型几何 P2S → 日志与 HTML。评估期间暂停训练。
+5. 评估使用完成该组优化器更新、增密/剪枝及透明度重置后的模型；保持现有组末事件顺序。实际训练时间必须包含这些训练操作。
+6. 横轴使用评估开始前冻结的实际累计训练时间。目标时间仅用于触发，不能代替横轴数据。
+7. 同一组跨过多个时间节点，只评估一次；时间触发、原有迭代触发与最终测试重合时，也只评估一次。
+8. 3000/7000 秒预算使用同一个训练时钟。达到预算后完成当前组再停止，允许超出一个组的剩余训练耗时；记录真实结束时间。
+9. 新功能默认关闭，原有训练方式仍可运行。开启质量监测时，PSNR 和 P2S 均为目标指标；几何真值来源必须显式配置。
+
+二、当前代码基础
+
+train.py
+  - training()：完整训练组循环、组末事件、按时长停止、模型保存和检查点。
+  - current_training_time_seconds()：目前为经过时间减输出写入时间。
+  - run_output_write()/exclude_output_write_time()：目前只能排除部分输出操作。
+  - training_report()：遍历完整测试集和少量训练视角，计算 PSNR/L1；没有返回值。
+  - 测试内部只单独扣除了图片写入时间，测试渲染和指标计算仍计入训练时间。
+  - optimizer.step() 后先读取时间，再进行组末增密/重置；这个时间不能直接作为最终评估时刻。
+
+utils/group_schedule.py
+  - 已有完整训练组调度。新增时间调度应与其并存，不改变迭代事件的量化规则。
+
+utils/loss_curve_logger.py
+  - 已有 CSV、离线 HTML、原子替换 HTML 和恢复历史日志的实现，可参考结构。
+
+scene/__init__.py、output/gs2d_batch_mesh.py
+  - 已有高斯 PLY 保存、确定性 surfel 采样和 Poisson 导出。
+  - Scene.save() 同时进行采样及 Poisson 重建，不能作为每次 P2S 评估的唯一入口。
+  - output/ 被 Git 忽略。需要复用的评估代码应提取到 utils/ 下可追踪的模块。
+
+三、步骤 1：统一训练时钟
+依赖：无。完成后可以独立使用新的训练时间和按时长停止。
+
+建议涉及文件：
+  新增 utils/training_clock.py
+  修改 train.py
+  必要时调整 utils/loss_curve_logger.py 的时间恢复逻辑
+
+实施内容：
+1. 实现 TrainingClock，以 time.perf_counter() 累计有效训练区间，提供 elapsed_seconds、暂停/恢复和排除区间接口。
+2. 排除区间支持嵌套。外层已暂停时，内部保存图片或刷新曲线不能再次扣除时间。
+3. 开始累计前确保初始化 CUDA 工作完成；从训练进入非训练区间时，先同步训练设备，再暂停时钟。GPU 完成训练的等待时间归入训练。
+4. 测试/GUI 可能产生 GPU 工作，恢复训练计时前应确保这些工作完成，其等待时间归入非训练。
+5. 不为每个标量写入新增 CUDA 同步。尽可能在连续训练区间、组末及 GPU 评估边界统一同步；控制同步带来的额外开销。
+6. 将测试整段、TensorBoard、LossCurveLogger、终端进度输出、模型导出、检查点 capture 与保存、GUI 渲染/等待统一放入非训练区间。
+7. 所有时间读取、losses.csv、GUI 时间展示、预算停止判断使用同一时钟。组末时间在结构调整完成且 GPU 同步后重新读取。
+8. 时钟使用 try/finally 或上下文管理器恢复状态，评估失败时不会残留错误的计时状态。
+9. 新检查点建议升为 version=3，保存 training_time_seconds、timing_policy_version。读取时兼容 version=2 和旧 tuple 格式，不改变高斯参数恢复方式。
+10. 恢复时优先使用检查点中的时间；旧检查点可回退到截至其 iteration 的历史日志，并明确标记 legacy 时间口径。旧日志已计入的测试时间无法准确反推，正式质量—时间比较建议从新运行开始。
+
+验收标准：
+  - 用可注入的假时钟验证：训练区间累计，暂停区间不累计，嵌套暂停不重复扣除。
+  - 在模拟测试/保存区间增加固定延迟，累计训练时间不变，wall_seconds 增加。
+  - 组末增密/重置计入训练时间，模型保存与 Poisson 导出不计入。
+  - 新检查点恢复后时间连续；旧格式仍可加载并标记口径差异。
+  - 3000/7000 秒停止条件与日志横轴使用同一个时间定义。
+
+四、步骤 2：增加组末测试时间触发
+依赖：步骤 1。可先沿用现有 PSNR 打印确认触发行为。
+
+建议涉及文件：
+  新增 utils/quality_time_schedule.py
+  修改 train.py 的参数入口、training() 参数传递与组末调度
+  扩展检查点的监测状态字段
+
+建议参数（名称可按项目惯例调整）：
+  --quality_time_preset {3000,7000}   启用对应时间节点预设
+  --quality_test_seconds T1 T2 ...   自定义累计训练时间节点，优先于预设
+  继续使用 --stop_after_training_seconds 指定停止预算
+
+参数处理注意：
+  - 时间列表使用 parser.add_argument(..., nargs='+', type=float) 显式注册。
+  - 当前 ParamGroup 自动注册机制不适合直接声明 nargs 列表；通过独立监测配置传入 training()。
+  - 预设只负责节点，不隐式修改学习率、增密计划或训练预算。
+  - 检查节点为有限正数，排序并去重；超过有效预算的节点明确报错或提示，不静默截断。
+
+推荐预设，单位秒：
+  3000：
+  10,20,30,50,75,100,120,150,200,300,400,500,650,800,
+  1000,1250,1500,1750,2000,2250,2500,3000
+  共 22 个目标节点。
+
+  7000：
+  使用上述全部节点，再追加 4000,5000,6000,7000。
+  共 26 个目标节点。
+
+组末流程：
+1. 完成当前组的参数更新与结构调整。
+2. 同步 GPU，冻结 actual_training_seconds。
+3. 找出所有尚未消费且 target <= actual_training_seconds 的节点。
+4. 合并触发原因：time、iteration、final。
+5. 存在任一触发原因时，暂停计时并执行一次完整评估。保存 covered_target_seconds、group、iteration、实际时间。
+6. 整段评估与输出完成后恢复训练计时，继续下一组或结束。
+
+边界约定：
+  - 目标 120 秒，组末实际 127 秒：记录并绘制 127 秒。
+  - 一个组跨过 100/120/150 秒：记录一行，covered_target_seconds=[100,120,150]。
+  - 停止预算与节点重合：只测试一次。
+  - 自然达到迭代上限时也保存最终评估，不假装已达到时间预算。
+  - --iterations 是独立上限，必须足够大才能覆盖预算；提前结束时写明 termination_reason。
+  - 初始化模型如需测试，使用独立 baseline 标记；不要伪造正时间用于对数轴。
+  - 恢复时只恢复实际完成的节点及对应检查点状态。评估结果写入成功后再提交节点消费状态。
+  - 监测配置变化时按目标值核对状态，不盲目沿用旧索引；恢复失败记录时保留状态，按明确规则重试。
+
+验收标准：
+  - 假时间序列覆盖单节点、跨多节点、相等边界、预算结束及提前结束。
+  - 同一个 iteration 的多种触发只调用一次测试。
+  - 测试长耗时不会使后续节点提前触发。
+  - 保存并恢复检查点后，不重复已完成节点，不跳过待执行节点。
+
+五、步骤 3：测试函数返回 PSNR 与 P2S
+依赖：步骤 1、2。
+
+建议涉及文件：
+  修改 train.py 的 training_report()
+  新增 utils/geometry_metrics.py
+  将复用的 surfel 采样代码提取到 utils/gaussian_surface_sampling.py
+  修改 scene/__init__.py 与 output/gs2d_batch_mesh.py 的相关导入（若进行提取）
+
+PSNR 实施内容：
+1. 将“触发判断”和“实际评估”分开，由组末调度器统一决定是否调用。
+2. 使用 torch.no_grad()，按固定测试相机顺序遍历全部 scene.getTestCameras()。
+3. 保持当前输出归一化和 clamp 口径，使用原始测试 GT；训练去噪图不替代测试 GT。
+4. 每张测试图计算 PSNR，再取算术平均，不能改成先合并全部 MSE 后取 PSNR。
+5. 返回 Python 标量及状态，包括 test_psnr_db、num_test_views；原有 train 视角指标只作为诊断，不进入质量曲线。
+6. 空测试集返回明确失败状态，不能得到伪造的平均值或被训练集替代。
+
+P2S 实施内容：
+1. 开始实施前核对现有实验/论文的 P2S 定义和 GT 来源，确保最终指标与曲线指标一致。
+2. 若尚无既定定义，采用预测 surfel 表面采样点到 GT 三角网格的单向平均欧氏距离：
+   P2S = mean_p min_q ||p-q||，p 属于预测点集合，q 属于 GT 网格表面。
+3. 显式配置 --quality_gt_mesh，并在训练前加载、检查面片及坐标系。初始化点云及其 Poisson 参考网格不自动视为 GT。
+4. 指定并持久化单位、坐标变换、评价范围、采样策略、透明度阈值和采样上限。各节点固定口径，不逐节点重新对齐来掩盖误差。
+5. 优先从当前模型的内存参数生成样本；复用现有确定性 surfel 采样算法，避免每次 Scene.save() 触发 Poisson 重建。
+6. 计算点到三角面的最近距离，可使用 trimesh.proximity.closest_point；采用分块查询控制内存，GT 的空间索引跨节点复用。
+7. 当前样本是高斯密度/透明度相关采样，并非均匀网格面积采样；日志中准确注明。若既有评估采用网格采样或高斯中心，必须沿用该协议。
+8. P2S 每个模型状态计算一次，与测试相机数量无关；不得使用最近 GT 顶点距离替代真正的点到面距离。
+9. 固定配置错误（GT 不存在、不是有效网格等）在训练开始前报错；临时无有效几何样本则保留 PSNR，P2S 记为缺失值并记录原因。
+10. NaN、Infinity 和失败值不能转为 0；严格 JSON 使用 null，并保留 status/error。PSNR 的精确匹配 +Infinity 情况单独标记。
+
+建议返回结构：
+  test_psnr_db: float 或 None
+  p2s: float 或 None
+  p2s_unit: str
+  num_test_views: int
+  num_geometry_samples: int
+  psnr_status/p2s_status: str
+  error: str 或 None
+
+验收标准：
+  - 已知图像验证 PSNR 及逐帧平均口径；空集合有明确状态。
+  - 简单平面网格：面上点 P2S 为 0，法向偏移 d 的点距离为 |d|。
+  - 面片内部点用例验证不是最近顶点距离；分块计算与整批计算一致。
+  - 空几何、无效 GT 与非有限数值得到正确状态。
+  - 两次评估同一模型得到一致结果，且不修改参数、梯度或优化器状态。
+
+六、步骤 4：独立质量日志与 HTML 曲线
+依赖：步骤 1、2、3。
+
+建议涉及文件：
+  新增 utils/quality_curve_logger.py
+  修改 train.py 的监测初始化、组末评估结果写入及关闭流程
+
+输出位置：
+  <model_path>/quality_curves/config.json
+  <model_path>/quality_curves/metrics.csv
+  <model_path>/quality_curves/metrics.jsonl
+  <model_path>/quality_curves/quality_time.html
+  <model_path>/quality_curves/psnr_time.html
+  <model_path>/quality_curves/p2s_time.html
+
+日志字段：
+  schema_version, timing_policy_version, iteration, group,
+  covered_target_seconds, trigger_reasons, actual_training_seconds,
+  wall_seconds, evaluation_seconds, test_psnr_db, p2s, p2s_unit,
+  num_test_views, num_geometry_samples, psnr_status, p2s_status, error
+
+实施内容：
+1. QualityCurveLogger 与 LossCurveLogger 独立。CSV 用于分析，JSONL 为结构化恢复记录，config.json 保存时间节点、GT、采样与指标协议。
+2. 每次完整评估生成一条记录并立即 flush，再刷新 HTML；日志与绘图耗时不计入训练时间。
+3. evaluation_seconds 统计评估计算及评估相关导出；HTML 写入不要求计入该字段，但必须排除出训练时钟。
+4. HTML 使用内嵌数据和本地 JavaScript/SVG 或 canvas，双击即可打开，不依赖 CDN、网络或 TensorBoard。
+5. quality_time.html 上下排列 PSNR/P2S 两幅图，共享时间范围；默认横轴为对数，支持切换线性时间轴。单指标页面沿用相同交互。
+6. 纵轴默认线性，明确 PSNR (dB)、P2S (单位)；提示 PSNR 越高越好、P2S 越低越好。
+7. 悬停显示实际时间、覆盖目标、iteration、group、指标及评估耗时。数据点之间直线连接，不默认平滑或插补。
+8. 对数轴仅使用实际时间 > 0 的点；缺失指标断开曲线。零点、单点、常数曲线均可正常显示；不得丢失超过预算的最终点。
+9. 用临时文件加 os.replace() 原子更新 HTML。无任何测试结果时仍生成明确的空状态页面。
+10. 恢复检查点时，以对应 iteration 截断日志中的未来记录，按运行/iteration 去重并重建 CSV/HTML。CSV 与 JSONL 不一致时，以有效 JSONL 记录重建。
+11. 正常结束、异常和 KeyboardInterrupt 路径均关闭文件；已完成记录必须可读取，不能为写日志而无条件启动新的测试。
+
+验收标准：
+  - 每个评估对应一行实际时间记录，目标节点合并字段正确。
+  - 离线浏览器中切换线性/对数轴和悬停提示正常。
+  - 缺失 P2S、空日志、一个点、重复时间和常数序列均可显示。
+  - 中断恢复后日志无未来记录、无重复点，HTML 与有效日志一致。
+
+七、整体联调与执行顺序
+
+依次执行步骤 1 → 2 → 3 → 4；每步完成其验收后再进入下一步。
+每步单独提交实现，便于回溯。此规划不要求创建提交或立即执行训练。
+
+联调流程：
+1. CPU 测试：假时钟、时间节点调度、日志恢复、HTML 数据处理及解析参数。
+2. 几何测试：上述简单网格的距离和分块一致性。
+3. GPU 小规模烟测：短预算与几个短节点，验证真实组末同步和完整测试集评估。
+4. 给评估回调加入可控延迟，对照检查训练时间不增加、实际运行时间增加。
+5. 在同一组制造时间、迭代、最终触发重合，确认仅一次 PSNR/P2S 计算。
+6. 中断后从组末检查点恢复，核对时间、模型 iteration、已完成节点和曲线记录一致。
+7. 正式执行 3000/7000 秒实验前，确认 GT 协议、测试集合和足够大的迭代上限；不同项目采用统一目标节点。
+8. 检查已有组调度测试，确认新增功能关闭时训练方式仍正常运行。
+
+实现完成后可使用的命令模板（新增参数当前尚未实现）：
+  python train.py -s <dataset> -m <output_dir> --iterations <足够大的迭代上限> --stop_after_training_seconds 3000 --quality_time_preset 3000 --quality_gt_mesh <GT网格路径>
+  python train.py -s <dataset> -m <output_dir> --iterations <足够大的迭代上限> --stop_after_training_seconds 7000 --quality_time_preset 7000 --quality_gt_mesh <GT网格路径>
+
+最终交付检查：
+  [ ] 所有训练时间使用统一有效训练时钟。
+  [ ] 测试渲染和全部指标计算均排除出训练时间。
+  [ ] 指定时间在完整组末触发，日志记录实际训练时间。
+  [ ] 测试集平均 PSNR 与当前几何 P2S 由评估函数返回。
+  [ ] 每个输出目录存在独立质量日志和离线 HTML 曲线。
+  [ ] 断点续训、失败指标、重复触发和最终输出有明确处理。
