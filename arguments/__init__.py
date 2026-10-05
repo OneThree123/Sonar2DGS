@@ -95,7 +95,6 @@ class OptimizationParams(ParamGroup):
         self.lambda_dist = 1.0 # was 1.0
         self.lambda_normal = 0.02  # was 0.02
         self.regularization_from_iter = 2_000
-        self.loss_intensity_mode = "mean_match"#"normalized"#
         self.anti_noise = False
         self.anti_noise_min_component_size = 256
         self.anti_noise_min_neighbors = 6

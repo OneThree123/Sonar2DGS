@@ -425,15 +425,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         getattr(opt, "stop_after_training_seconds", 0.0), "stop_after_training_seconds"
     )
 
-    loss_intensity_mode = str(
-        getattr(opt, "loss_intensity_mode", "normalized") or "normalized"
-    ).lower()
-    if loss_intensity_mode not in ("normalized", "mean_match"):
-        raise ValueError(
-            "Unknown loss intensity mode: "
-            f"{loss_intensity_mode!r}. Expected 'normalized' or 'mean_match'."
-        )
-
     opacity_reset_mode = normalize_opacity_reset_mode(
         getattr(opt, "opacity_reset_mode", "interval")
     )
@@ -845,13 +836,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             foreground_mask.to(render_intensity.device), 0.0, 1.0
                         )
 
-                    loss_intensity, _ = prepare_sonar_intensity_for_loss(
-                        render_intensity,
-                        gt_image,
-                        foreground_mask,
-                        method=getattr(viewpoint_cam, "normalizing_method", "all"),
-                        loss_mode=loss_intensity_mode,
-                    )
+                    loss_intensity, _ = prepare_sonar_intensity_for_loss(render_intensity)
 
                     Ll1 = masked_l1_loss(loss_intensity, gt_image, foreground_mask)
                     ssim_loss_intensity = loss_intensity

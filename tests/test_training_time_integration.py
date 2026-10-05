@@ -21,6 +21,7 @@ from arguments import ModelParams, OptimizationParams, PipelineParams
 from utils.group_schedule import GroupTrainingSchedule
 from utils.loss_curve_logger import LossCurveLogger
 from utils.loss_utils import masked_l1_loss, weighted_mean
+from utils.intensity_utils import prepare_sonar_intensity_for_loss
 from utils.training_clock import (
     TIMING_POLICY_VERSION, TrainingClock, checkpoint_training_time, validate_seconds,
 )
@@ -214,7 +215,7 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
             prepare_output_and_logger=lambda dataset: Writer(), network_gui=gui,
             render=render, training_report=report, masked_l1_loss=masked_l1_loss,
             weighted_mean=weighted_mean, masked_ssim=lambda *args: torch.tensor(0.5),
-            prepare_sonar_intensity_for_loss=lambda image, *args, **kw: (image, None),
+            prepare_sonar_intensity_for_loss=prepare_sonar_intensity_for_loss,
         )
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
         return namespace

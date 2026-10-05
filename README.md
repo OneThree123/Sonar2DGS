@@ -83,6 +83,16 @@ Commandline arguments for regularizations
 --lambda_distortion # hyperparameter for depth distortion
 --depth_ratio # 0 for mean depth and 1 for median depth, 0 works for most cases
 ```
+
+Sonar training, evaluation and preview use the same brightness processing:
+`I = clamp(I_raw / max(quantile(I_raw, 0.998), 1e-8), 0, 1)`.
+The 99.8th percentile is computed over the full rendered frame using linear
+interpolation; it is mapped to 1 and brighter pixels are clipped to 1. Training
+gradients pass through the quantile and scaling. Ground-truth images retain
+their existing [0, 1] values. GT mean matching, per-row normalization and the
+`--loss_intensity_mode` option have been removed. Quality logs record the new
+normalization protocol so historical maximum-normalized metrics are distinct.
+
 **Tips for adjusting the parameters on your own dataset:**
 - For unbounded/large scenes, we suggest using mean depth, i.e., ``depth_ratio=0``,  for less "disk-aliasing" artifacts.
 

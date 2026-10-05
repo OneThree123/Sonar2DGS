@@ -60,6 +60,10 @@ class QualityTimeIntegrationTest(base.TrainingTimeIntegrationTest):
         self.assertEqual(monitor.logger.rows[0]["trigger_reasons"], ["time", "iteration", "final"])
         self.assertEqual(monitor.logger.rows[0]["actual_training_seconds"], 22)
         self.assertNotIn("opacity_reset", self.events)
+        self.assertEqual(monitor.logger.config["intensity_normalization"],
+                         dict(method="full_frame_quantile", quantile=0.998,
+                              interpolation="linear", clamp=[0.0, 1.0]))
+        self.assertIn("q998", monitor.logger.config["psnr_protocol"])
 
     def test_final_has_no_future_node_coverage_and_reset_is_after_evaluation(self):
         self.run_training(budget=0, iterations=6, testing_iterations=[], quality_time_test=True)
