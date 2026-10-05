@@ -1092,12 +1092,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 group_idx,
                             )
 
+                        is_test_iteration = group_idx in testing_events
+                        test_image_output_dir = os.path.join(
+                            scene.model_path, "test_renders", f"iteration_{group_end_step}"
+                        )
                         geometry_artifacts = None
                         if quality_monitor is not None:
                             geometry_artifacts = quality_monitor.evaluate(
                                 gaussians, actual_seconds=training_time_seconds,
                                 iteration=group_end_step, group=group_idx,
-                                iteration_trigger=group_idx in testing_events,
+                                iteration_trigger=is_test_iteration,
                                 final_trigger=stop_requested or group_idx == group_schedule.total_groups,
                                 report=lambda output_dir, save_images: training_report(
                                     tb_writer, group_end_step, effective_testing_iterations,
@@ -1105,6 +1109,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                     log_intensity_stats=getattr(pipe, "intensity_stats", False),
                                     force=True, anti_noise_enabled=anti_noise_enabled,
                                     output_dir=output_dir, save_test_images=save_images,
+                                    additional_image_output_dirs=(test_image_output_dir,)
+                                    if is_test_iteration else (),
                                 ),
                             )
                         else:
@@ -1115,15 +1121,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 force=stop_requested, anti_noise_enabled=anti_noise_enabled,
                             )
 
-                        if (
-                            group_end_step in effective_saving_iterations
-                            or stop_requested
-                        ):
+                        save_geometry = group_end_step in effective_saving_iterations or stop_requested
+                        if is_test_iteration or save_geometry:
                             print(
                                 f"\n[GROUP {group_idx} / ITER {group_end_step}] "
                                 "Saving Gaussians"
                             )
-                            if geometry_artifacts is None:
+                            if not save_geometry:
+                                scene.save(group_end_step, export_geometry=False)
+                            elif geometry_artifacts is None:
                                 scene.save(group_end_step)
                             else:
                                 scene.save(group_end_step, geometry_artifacts=geometry_artifacts)
@@ -1339,6 +1345,7 @@ def training_report(
     anti_noise_enabled=False,
     output_dir=None,
     save_test_images=True,
+    additional_image_output_dirs=(),
 ):
     if not force and iteration not in testing_iterations:
         return
@@ -1348,6 +1355,9 @@ def training_report(
     device = scene.gaussians.get_xyz.device
     image_output_dir = output_dir if output_dir is not None else os.path.join(
         scene.model_path, "test_renders", "iteration_{}".format(iteration))
+    image_output_dirs = [image_output_dir] if save_test_images else []
+    image_output_dirs.extend(additional_image_output_dirs)
+    image_output_dirs = list(dict.fromkeys(os.fspath(directory) for directory in image_output_dirs))
     validation_configs = (
         {"name": "test", "cameras": scene.getTestCameras()},
         {"name": "train", "cameras": scene.getTrainCameras()[:5]},
@@ -1359,6 +1369,7 @@ def training_report(
 
         l1_test = 0.0
         psnr_test = 0.0
+        config_image_output_dirs = image_output_dirs if config["name"] == "test" else ()
         for idx, viewpoint in enumerate(config["cameras"]):
             render_pkg = render_func(viewpoint, scene.gaussians, *render_args)
             if log_intensity_stats:
@@ -1370,7 +1381,7 @@ def training_report(
             image = torch.clamp(render_pkg["r_intensity"], 0.0, 1.0).to(device)
             gt_image = torch.clamp(viewpoint.original_image.to(device), 0.0, 1.0)
 
-            if config["name"] == "test" and save_test_images:
+            for image_output_dir in config_image_output_dirs:
                 render_path = os.path.join(
                     image_output_dir,
                     "renders",
@@ -1430,7 +1441,8 @@ if __name__ == "__main__":
     parser.add_argument("--ip", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=6009)
     parser.add_argument("--detect_anomaly", action="store_true", default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1, 500, 2_000, 7_000, 15_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1, 500, 2_000, 7_000, 15_000, 30_000],
+                        help="Always export test images and GS PLY at these iterations, rounded up to complete groups.")
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[1, 500, 2_000, 7_000, 15_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
@@ -1439,7 +1451,8 @@ if __name__ == "__main__":
     parser.add_argument("--quality_time_test", action="store_true",
                         help="Record PSNR/mesh P2S at 26 training-time nodes and iteration/final triggers.")
     parser.add_argument("--quality_save_test_images", action="store_true",
-                        help="Export test renders inside the independent quality results directory.")
+                        help="Also export test renders inside the independent quality results directory; "
+                             "test iterations always export to test_renders.")
     parser.add_argument(
         "--export_anti_noise_ground_truths",
         action="store_true",

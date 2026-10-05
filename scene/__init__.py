@@ -122,13 +122,15 @@ class Scene:
             print("Saving initial Gaussians")
             self.save(0)
 
-    def save(self, iteration, geometry_artifacts=None):
+    def save(self, iteration, geometry_artifacts=None, *, export_geometry=True):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         point_cloud_file = os.path.join(point_cloud_path, "point_cloud.ply")
         sampled_pointcloud_file = os.path.join(point_cloud_path, "sampled_surface_points.ply")
         poisson_mesh_file = os.path.join(point_cloud_path, "poisson_mesh.ply")
 
         self.gaussians.save_ply(point_cloud_file)
+        if not export_geometry:
+            return
         if geometry_artifacts is not None:
             if geometry_artifacts.get("sampled_points_path"):
                 shutil.copy2(geometry_artifacts["sampled_points_path"], sampled_pointcloud_file)

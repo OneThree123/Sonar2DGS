@@ -40,6 +40,8 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         self.writers = []
         self.loggers = []
         self.raise_in_evaluation = None
+        self.report_calls = []
+        self.save_calls = []
 
     def advance(self, name, seconds, *, training):
         if self.clock is not None:
@@ -106,8 +108,11 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
             def getTestCameras(self):
                 return [camera]
 
-            def save(self, iteration, geometry_artifacts=None):
-                test.advance("model_geometry_export", test.output_delay, training=False)
+            def save(self, iteration, geometry_artifacts=None, *, export_geometry=True):
+                test.save_calls.append((iteration, export_geometry))
+                test.assertFalse(torch.is_grad_enabled())
+                test.advance("model_geometry_export" if export_geometry else "model_export",
+                             test.output_delay, training=False)
                 test.pending_gpu += test.output_delay
 
         class Logger(LossCurveLogger):
@@ -179,6 +184,8 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
             )
 
         def report(*args, **kwargs):
+            test.report_calls.append((args[1], kwargs))
+            test.assertFalse(torch.is_grad_enabled())
             test.advance("evaluation_PSNR_P2S", test.output_delay, training=False)
             test.pending_gpu += test.output_delay
             if test.raise_in_evaluation:
@@ -220,7 +227,8 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         return namespace
 
     def run_training(self, *, budget=20, checkpoint=None, iterations=6,
-                     testing_iterations=None, quality_time_test=False):
+                     testing_iterations=None, saving_iterations=None, quality_time_test=False,
+                     quality_save_test_images=False, eval_mode=False):
         self.clock = None
         parser = ArgumentParser()
         model = ModelParams(parser)
@@ -234,6 +242,7 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         args.densify_until_iter = 100
         args.densification_interval = 2
         args.opacity_reset_interval = 2
+        args.eval = eval_mode
         namespace = self.namespace()
         output = io.StringIO()
         save = torch.save
@@ -248,7 +257,8 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
             namespace["training"](
                 model.extract(args), opt.extract(args), pipe.extract(args),
                 [2, 4, 6] if testing_iterations is None else testing_iterations,
-                [2, 4, 6], [2, 4, 6], checkpoint, 2, quality_time_test,
+                [2, 4, 6] if saving_iterations is None else saving_iterations,
+                [2, 4, 6], checkpoint, 2, quality_time_test, quality_save_test_images,
             )
         return output.getvalue()
 
@@ -275,6 +285,26 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         self.output_delay = 10000
         self.run_training(budget=0)
         self.assertEqual(self.clock.finish(), 72)
+
+    def test_test_nodes_save_gs_without_geometry_and_merge_with_save_nodes(self):
+        self.run_training(budget=0, testing_iterations=[1, 2, 3, 20], saving_iterations=[4, 6])
+        self.assertEqual(self.save_calls, [(2, False), (4, True), (6, True)])
+        self.assertEqual(self.events.count("model_export"), 1)
+        self.assertEqual(self.clock.finish(), 72)
+        self.assertEqual(self.events.count("optimizer"), 6)
+
+    def test_stop_saves_geometry_even_without_matching_test_or_save_node(self):
+        self.run_training(testing_iterations=[4], saving_iterations=[])
+        self.assertEqual(self.save_calls, [(2, True)])
+        self.assertTrue(self.report_calls[-1][1]["force"])
+
+    def test_resume_skips_completed_test_exports(self):
+        self.run_training(budget=0, iterations=2, testing_iterations=[2], saving_iterations=[])
+        self.assertEqual(self.save_calls, [(2, False)])
+        self.save_calls.clear()
+        self.run_training(budget=0, checkpoint=str(self.root / "chkpnt2.pth"),
+                          testing_iterations=[2, 4], saving_iterations=[6])
+        self.assertEqual(self.save_calls, [(4, False), (6, True)])
 
     def test_resume_uses_checkpoint_and_skips_already_reached_budget(self):
         self.run_training()

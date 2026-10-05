@@ -91,7 +91,7 @@ class TrainingTimeGPUTest(unittest.TestCase):
                     excluded_callbacks.append(name)
                 return result
 
-            def run(checkpoint=None):
+            def run(checkpoint=None, saving_iterations=(2, 4)):
                 torch.manual_seed(0)
                 np.random.seed(0)
                 text = io.StringIO()
@@ -104,7 +104,7 @@ class TrainingTimeGPUTest(unittest.TestCase):
                 ), patch.object(train.network_gui, "try_connect", lambda items: None):
                     train.training(
                         model.extract(args), optimizer.extract(args), pipeline.extract(args),
-                        [2, 4], [2, 4], [2, 4], checkpoint, 2,
+                        [2, 4], saving_iterations, [2, 4], checkpoint, 2,
                     )
                 return text.getvalue()
 
@@ -129,7 +129,12 @@ class TrainingTimeGPUTest(unittest.TestCase):
             self.assertFalse((output / "chkpnt4.pth").exists())
 
             args.stop_after_training_seconds = 0
-            text = run(str(checkpoint2))
+            text = run(str(checkpoint2), saving_iterations=[])
+            test_only_output = output / "point_cloud/iteration_4"
+            self.assertTrue((test_only_output / "point_cloud.ply").is_file())
+            self.assertFalse((test_only_output / "sampled_surface_points.ply").exists())
+            self.assertFalse((test_only_output / "poisson_mesh.ply").exists())
+            self.assertTrue(list((output / "test_renders/iteration_4/renders").glob("*.png")))
             state4 = torch.load(output / "chkpnt4.pth", weights_only=False)
             self.assertGreater(state4["training_time_seconds"], state2["training_time_seconds"])
             self.assertEqual(state4["training_time_seconds"], clocks[-1].finish())

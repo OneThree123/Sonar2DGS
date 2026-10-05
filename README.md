@@ -109,6 +109,18 @@ Timing checks: `python -m unittest discover -s tests -v`. In an environment with
 the compiled CUDA extensions, enable the real GPU smoke test with
 `RUN_TRAINING_TIME_GPU_TESTS=1 python -m unittest discover -s tests -p test_training_time_gpu.py -v`.
 
+Every `--test_iterations` node exports test renders and ground truths under
+`<output_dir>/test_renders/iteration_<effective_iteration>/`, and GS parameters
+under `<output_dir>/point_cloud/iteration_<effective_iteration>/point_cloud.ply`.
+These exports are always enabled, regardless of `--eval`, `--quality_time_test`
+or `--quality_save_test_images`. Iteration targets still round up to complete
+training groups; targets in the same group produce one export. Unreached targets
+are not exported, and checkpoint resumes skip already completed groups.
+`--save_iterations` continues to control the existing GS and geometry exports;
+test-only nodes save GS PLY without additional geometry reconstruction.
+Coincident test/save nodes save the GS PLY once. Export work is excluded from
+pure training time, but adds wall time and disk usage.
+
 For sonar quality versus training time, enable the independent observation mode:
 
 ```bash
@@ -135,6 +147,8 @@ the cached GT mesh, and `run_<id>/` contains `metrics.csv`, `metrics.jsonl`,
 `summary.json`, per-evaluation meshes and `quality_time.html`. The HTML works
 offline with linear/log time axes and hover details. Use
 `--quality_save_test_images` to export renders and ground truths there too.
+At iteration nodes, both destinations reuse the same rendered images; time-only
+and final-only quality evaluations export images there only when this flag is set.
 Use `--checkpoint_iterations <iterations...>` to save resumable checkpoints;
 quality history and pending resets resume through `--start_checkpoint`.
 

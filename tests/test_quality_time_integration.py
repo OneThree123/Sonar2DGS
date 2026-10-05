@@ -121,3 +121,74 @@ class QualityTimeIntegrationTest(base.TrainingTimeIntegrationTest):
         self.assertTrue(monitor.logger._jsonl_file.closed)
         self.assertEqual(monitor.schedule.consumed, set())
         self.assertEqual(json.loads((monitor.logger.output_dir / "summary.json").read_text())["termination_reason"], "error")
+
+    def test_iteration_exports_independent_of_quality_and_eval_flags(self):
+        self.quality_targets = (1000,)
+        for quality in (False, True):
+            for images in (False, True):
+                for eval_mode in (False, True):
+                    with self.subTest(quality=quality, images=images, eval_mode=eval_mode):
+                        self.report_calls.clear()
+                        self.save_calls.clear()
+                        self.run_training(budget=0, testing_iterations=[1, 2, 3],
+                                          saving_iterations=[6], quality_time_test=quality,
+                                          quality_save_test_images=images, eval_mode=eval_mode)
+                        self.assertEqual(self.save_calls, [(2, False), (4, False), (6, True)])
+                        for iteration, kwargs in self.report_calls:
+                            if quality:
+                                expected = (str(self.root / f"test_renders/iteration_{iteration}"),)
+                                self.assertEqual(kwargs["additional_image_output_dirs"],
+                                                 expected if iteration in (2, 4) else ())
+                                self.assertEqual(kwargs["save_test_images"], images)
+                            else:
+                                self.assertNotIn("output_dir", kwargs)
+                                self.assertTrue(kwargs.get("save_test_images", True))
+                        self.assertEqual(self.clock.finish(), 72)
+
+    def test_time_and_final_only_nodes_do_not_export_regular_images_or_gs(self):
+        self.run_training(budget=0, testing_iterations=[4], saving_iterations=[],
+                          quality_time_test=True)
+        self.assertEqual(self.save_calls, [(4, False)])
+        for iteration, kwargs in self.report_calls:
+            self.assertFalse(kwargs["save_test_images"])
+            self.assertEqual(kwargs["additional_image_output_dirs"],
+                             (str(self.root / "test_renders/iteration_4"),) if iteration == 4 else ())
+
+    def test_exports_preserve_parameter_updates_and_training_clock(self):
+        original_namespace = self.namespace
+        parameter_steps = []
+
+        def namespace_with_parameter_updates():
+            namespace = original_namespace()
+            model_class = namespace["GaussianModel"]
+
+            def model_factory():
+                model = model_class()
+                step = model.optimizer.step
+
+                def update():
+                    step()
+                    with torch.no_grad():
+                        model.get_xyz.add_(model.get_xyz.grad, alpha=-.01)
+                    parameter_steps.append(model.get_xyz.detach().clone())
+
+                model.optimizer.step = update
+                return model
+
+            namespace["GaussianModel"] = model_factory
+            return namespace
+
+        with patch.object(self, "namespace", namespace_with_parameter_updates):
+            self.run_training(budget=0, testing_iterations=[], saving_iterations=[])
+            baseline = torch.stack(parameter_steps)
+            baseline_seconds = self.clock.finish()
+            for quality in (False, True):
+                for images in (False, True):
+                    with self.subTest(quality=quality, images=images):
+                        parameter_steps.clear()
+                        self.run_training(budget=0, testing_iterations=[2, 4, 6],
+                                          saving_iterations=[6], quality_time_test=quality,
+                                          quality_save_test_images=images)
+                        torch.testing.assert_close(torch.stack(parameter_steps), baseline,
+                                                   rtol=0, atol=0)
+                        self.assertEqual(self.clock.finish(), baseline_seconds)

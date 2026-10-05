@@ -120,7 +120,7 @@ class QualityTimeGPUTest(unittest.TestCase):
                 self.assertEqual(row["actual_training_seconds"], clocks[-1].finish())
                 self.assertTrue(list((monitor.logger.output_dir / "evaluations").glob("*/renders/*.png")))
                 self.assertTrue(Path(row["pred_mesh_path"]).is_file())
-                self.assertFalse((root / "output/test_renders").exists())
+                self.assertTrue(list((root / "output/test_renders/iteration_2/renders").glob("*.png")))
                 saved_mesh = root / "output/point_cloud/iteration_2/poisson_mesh.ply"
                 self.assertEqual(saved_mesh.read_bytes(), Path(row["pred_mesh_path"]).read_bytes())
 
