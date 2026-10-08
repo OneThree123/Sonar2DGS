@@ -5,6 +5,7 @@ import atexit
 import contextlib
 import csv
 import io
+import json
 import math
 import os
 import random
@@ -20,6 +21,7 @@ import torch
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from utils.group_schedule import GroupTrainingSchedule
 from utils.loss_curve_logger import LossCurveLogger
+from utils.loss_scale_logger import LossScaleLogger
 from utils.loss_utils import masked_l1_loss, weighted_mean
 from utils.training_clock import (
     TIMING_POLICY_VERSION, TrainingClock, checkpoint_training_time, validate_seconds,
@@ -213,7 +215,7 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         namespace = dict(
             os=os, math=math, random=random, atexit=atexit, torch=torch,
             GaussianModel=Gaussians, Scene=Scene, tqdm=Progress,
-            LossCurveLogger=Logger, TrainingClock=clock_factory,
+            LossCurveLogger=Logger, LossScaleLogger=LossScaleLogger, TrainingClock=clock_factory,
             GroupTrainingSchedule=GroupTrainingSchedule,
             TIMING_POLICY_VERSION=TIMING_POLICY_VERSION,
             OPACITY_RESET_POLICY_VERSION=OPACITY_RESET_POLICY_VERSION,
@@ -221,14 +223,14 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
             prepare_output_and_logger=lambda dataset: Writer(), network_gui=gui,
             render=render, training_report=report, masked_l1_loss=masked_l1_loss,
             weighted_mean=weighted_mean, masked_ssim=lambda *args: torch.tensor(0.5),
-            prepare_sonar_intensity_for_loss=lambda image, *args, **kw: (image, None),
+            prepare_sonar_intensity_for_loss=lambda image, *args, **kw: (image, torch.ones(1)),
         )
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
         return namespace
 
     def run_training(self, *, budget=20, checkpoint=None, iterations=6,
                      testing_iterations=None, saving_iterations=None, quality_time_test=False,
-                     quality_save_test_images=False, eval_mode=False):
+                     quality_save_test_images=False, eval_mode=False, loss_intensity_mode="mean_match"):
         self.clock = None
         parser = ArgumentParser()
         model = ModelParams(parser)
@@ -243,6 +245,7 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         args.densification_interval = 2
         args.opacity_reset_interval = 2
         args.eval = eval_mode
+        args.loss_intensity_mode = loss_intensity_mode
         namespace = self.namespace()
         output = io.StringIO()
         save = torch.save
@@ -272,11 +275,50 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         self.assertEqual(state["pending_opacity_reset"]["origin_group"], 1)
         self.assertNotIn("opacity_reset", self.events)
         self.assertEqual(state["version"], 3)
+        self.assertEqual(state["latest_batch_color_scale_mean"], 1.)
         self.assertEqual(state["completed_groups"], 1)
         self.assertIn("capture", self.events)
         self.assertTrue(self.writers[-1].closed)
         time_scalars = [item[1] for item in self.writers[-1].scalars if item[0] == "train/training_time_seconds"]
         self.assertEqual(time_scalars, [8, 22])
+
+    def test_loss_scale_table_tracks_shuffled_images_and_excludes_write_time(self):
+        test = self
+
+        class SlowScaleLogger(LossScaleLogger):
+            def log(self, *args):
+                test.advance("loss_scale_table", test.output_delay, training=False)
+                super().log(*args)
+
+        for mode in ("mean_match", "normalized"):
+            with self.subTest(mode=mode):
+                namespace = self.namespace()
+                scales = iter(range(1, 13))
+
+                def prepare(image, *args, **kwargs):
+                    scale = next(scales)
+                    return image, torch.tensor([scale if mode == "mean_match" else 1. / scale])
+
+                namespace.update(prepare_sonar_intensity_for_loss=prepare, LossScaleLogger=SlowScaleLogger)
+                with patch.object(self, "namespace", return_value=namespace):
+                    self.run_training(budget=0, iterations=12, loss_intensity_mode=mode)
+                with (self.root / "loss_scales.csv").open() as file:
+                    reader = csv.DictReader(file)
+                    image_columns = [column for column in reader.fieldnames if column.startswith("image_")]
+                    rows = list(reader)
+                self.assertEqual(len(rows), 6)
+                for iteration, report_kwargs in self.report_calls[-6:]:
+                    self.assertAlmostEqual(report_kwargs["latest_batch_color_scale_mean"],
+                                           iteration - .5, places=5)
+                checkpoint = torch.load(self.root / "chkpnt6.pth", weights_only=False)
+                self.assertAlmostEqual(checkpoint["latest_batch_color_scale_mean"], 5.5, places=5)
+                for group, row in enumerate(rows, start=1):
+                    order = json.loads(row["training_order"])
+                    for sample, camera_index in enumerate(order):
+                        self.assertAlmostEqual(float(row[image_columns[camera_index]]),
+                                               (group - 1) * 2 + sample + 1, places=5)
+                    self.assertEqual(float(row["training_time_seconds"]), 22 + (group - 1) * 25)
+                self.assertEqual(self.clock.finish(), 147)
 
     def test_evaluation_gui_and_output_delays_do_not_change_training_time(self):
         self.run_training(budget=0)
@@ -285,6 +327,26 @@ class TrainingTimeIntegrationTest(unittest.TestCase):
         self.output_delay = 10000
         self.run_training(budget=0)
         self.assertEqual(self.clock.finish(), 72)
+
+    def test_resumed_group_replaces_checkpoint_mean_before_evaluation(self):
+        for checkpoint, budget, scales, expected, iteration in (
+            (None, 20, [2., 4.], 3., 2),
+            (str(self.root / "chkpnt2.pth"), 40, [10., 20.], 15., 4),
+        ):
+            namespace = self.namespace()
+            coefficients = iter(scales)
+            namespace["prepare_sonar_intensity_for_loss"] = lambda image, *args, **kw: (
+                image, torch.tensor([next(coefficients)]),
+            )
+            self.report_calls.clear()
+            with patch.object(self, "namespace", return_value=namespace):
+                self.run_training(checkpoint=checkpoint, budget=budget)
+            self.assertEqual(len(self.report_calls), 1)
+            step, kwargs = self.report_calls[0]
+            self.assertEqual(step, iteration)
+            self.assertEqual(kwargs["latest_batch_color_scale_mean"], expected)
+            state = torch.load(self.root / f"chkpnt{iteration}.pth", weights_only=False)
+            self.assertEqual(state["latest_batch_color_scale_mean"], expected)
 
     def test_test_nodes_save_gs_without_geometry_and_merge_with_save_nodes(self):
         self.run_training(budget=0, testing_iterations=[1, 2, 3, 20], saving_iterations=[4, 6])

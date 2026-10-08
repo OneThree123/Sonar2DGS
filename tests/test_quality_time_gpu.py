@@ -24,6 +24,7 @@ class QualityTimeGPUTest(unittest.TestCase):
         from arguments import ModelParams, OptimizationParams, PipelineParams
         from utils import geometry_metrics
         from utils.gaussian_mesh import write_ply_pointcloud
+        from utils.intensity_normalization import normalize_test_intensity
         from utils.quality_time_monitor import QualityTimeMonitor
         from utils.training_clock import TrainingClock
 
@@ -74,6 +75,7 @@ class QualityTimeGPUTest(unittest.TestCase):
             clocks = []
             monitors = []
             reports = []
+            normalized_images = []
             reference_export = geometry_metrics.export_poisson_mesh_from_pointcloud_ply
             real_report = train.training_report
 
@@ -95,9 +97,24 @@ class QualityTimeGPUTest(unittest.TestCase):
                 reports.append(result)
                 return result
 
+            def normalize(raw, scale_mean):
+                before = clocks[-1].snapshot_seconds()
+                time.sleep(.02)
+                image, scale = normalize_test_intensity(raw, scale_mean)
+                clean = np.maximum(np.nan_to_num(raw.detach().cpu().double().numpy(),
+                                                 nan=0., posinf=0., neginf=0.), 0.)
+                reference = np.clip(clean * scale_mean, 0., 1.)
+                self.assertEqual(scale, scale_mean)
+                np.testing.assert_allclose(image.detach().cpu().numpy(), reference, rtol=1e-4, atol=1e-6)
+                self.assertEqual(before, clocks[-1].snapshot_seconds())
+                normalized_images.append(image.detach().cpu())
+                return image, scale
+
             with patch.object(train, "TrainingClock", clock_factory), patch.object(
                 train, "QualityTimeMonitor", monitor_factory,
             ), patch.object(train, "training_report", report), patch.object(
+                train, "normalize_test_intensity", normalize,
+            ), patch.object(
                 train.network_gui, "try_connect", lambda *args: None,
             ), patch.object(geometry_metrics, "POISSON_CONFIG", dict(geometry_metrics.POISSON_CONFIG, poisson_depth=5)), patch.object(
                 geometry_metrics, "PREDICTED_CONFIG", dict(geometry_metrics.PREDICTED_CONFIG, poisson_depth=5),
@@ -121,12 +138,23 @@ class QualityTimeGPUTest(unittest.TestCase):
                 self.assertTrue(list((monitor.logger.output_dir / "evaluations").glob("*/renders/*.png")))
                 self.assertTrue(Path(row["pred_mesh_path"]).is_file())
                 self.assertTrue(list((root / "output/test_renders/iteration_2/renders").glob("*.png")))
+                self.assertEqual(len(normalized_images), 1)
+                rendered_png = next((monitor.logger.output_dir / "evaluations").glob("*/renders/*.png"))
+                regular_png = next((root / "output/test_renders/iteration_2/renders").glob("*.png"))
+                self.assertEqual(rendered_png.read_bytes(), regular_png.read_bytes())
+                with Image.open(rendered_png) as saved:
+                    np.testing.assert_array_equal(np.asarray(saved),
+                                                  (normalized_images[0][0] * 255).round().byte().numpy())
+                gt = np.arange(512, dtype=np.uint8).reshape(32, 16).astype(np.float64) / 255.
+                mse = np.mean((normalized_images[0][0].double().numpy() - gt) ** 2)
+                self.assertAlmostEqual(reports[0]["test_psnr_db"], -10 * np.log10(mse), places=4)
                 saved_mesh = root / "output/point_cloud/iteration_2/poisson_mesh.ply"
                 self.assertEqual(saved_mesh.read_bytes(), Path(row["pred_mesh_path"]).read_bytes())
 
                 checkpoint = root / "output/chkpnt2.pth"
                 state = torch.load(checkpoint, weights_only=False)
                 self.assertEqual(state["pending_opacity_reset"]["origin_group"], 1)
+                self.assertEqual(state["latest_batch_color_scale_mean"], reports[0]["latest_batch_color_scale_mean"])
                 run(str(checkpoint))  # Budget already reached: no tests and no reset.
                 self.assertEqual(len(reports), 1)
                 self.assertEqual(reference_builder.call_count, 1)

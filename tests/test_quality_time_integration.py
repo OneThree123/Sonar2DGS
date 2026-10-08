@@ -1,6 +1,7 @@
 """Real training loop and monitoring transactions, with controlled training/output clocks."""
 
 import json
+import csv
 import time
 from unittest.mock import patch
 
@@ -8,6 +9,7 @@ import torch
 
 import test_training_time_integration as base
 from utils.quality_time_monitor import QualityTimeMonitor
+from utils.intensity_normalization import TEST_RENDER_NORMALIZATION_CONFIG
 
 
 class QualityTimeIntegrationTest(base.TrainingTimeIntegrationTest):
@@ -37,7 +39,8 @@ class QualityTimeIntegrationTest(base.TrainingTimeIntegrationTest):
 
         def quality_report(*args, **kwargs):
             report(*args, **kwargs)
-            return dict(test_psnr_db=25., num_test_views=1, psnr_status="ok")
+            return dict(test_psnr_db=25., num_test_views=1, psnr_status="ok",
+                        latest_batch_color_scale_mean=kwargs["latest_batch_color_scale_mean"])
 
         namespace.update(QualityTimeMonitor=monitor_factory, training_report=quality_report)
         return namespace
@@ -60,6 +63,13 @@ class QualityTimeIntegrationTest(base.TrainingTimeIntegrationTest):
         self.assertEqual(monitor.logger.rows[0]["trigger_reasons"], ["time", "iteration", "final"])
         self.assertEqual(monitor.logger.rows[0]["actual_training_seconds"], 22)
         self.assertNotIn("opacity_reset", self.events)
+        for key, value in TEST_RENDER_NORMALIZATION_CONFIG.items():
+            self.assertEqual(monitor.logger.config[key], value)
+        saved_config = json.loads((monitor.logger.output_dir / "config.json").read_text())
+        self.assertEqual(saved_config["render_normalization"], "latest_batch_color_scale_mean")
+        self.assertEqual(monitor.logger.rows[0]["latest_batch_color_scale_mean"], 1.)
+        with monitor.logger.csv_path.open() as output:
+            self.assertEqual(float(next(csv.DictReader(output))["latest_batch_color_scale_mean"]), 1.)
 
     def test_final_has_no_future_node_coverage_and_reset_is_after_evaluation(self):
         self.run_training(budget=0, iterations=6, testing_iterations=[], quality_time_test=True)

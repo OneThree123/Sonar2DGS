@@ -26,7 +26,9 @@ from utils.general_utils import PILtoTorch, safe_state
 from utils.group_schedule import GroupTrainingSchedule
 from utils.image_utils import psnr, render_net_image
 from utils.intensity_diagnostics import format_raw_intensity_stats
+from utils.intensity_normalization import normalize_test_intensity
 from utils.loss_curve_logger import LossCurveLogger
+from utils.loss_scale_logger import LossScaleLogger
 from utils.quality_time_monitor import QualityTimeMonitor
 from utils.quality_time_schedule import OPACITY_RESET_POLICY_VERSION
 from utils.training_clock import (
@@ -420,7 +422,7 @@ def get_anti_noise_settings(opt):
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, loss_curve_plot_interval=100,
-             quality_time_test=False, quality_save_test_images=False):
+             quality_time_test=True, quality_save_test_images=False):
     stop_after_training_seconds = validate_seconds(
         getattr(opt, "stop_after_training_seconds", 0.0), "stop_after_training_seconds"
     )
@@ -661,6 +663,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         )
 
     initial_training_seconds, training_time_scope = checkpoint_training_time(checkpoint_state)
+    latest_batch_color_scale_mean = (
+        checkpoint_state.get("latest_batch_color_scale_mean")
+        if isinstance(checkpoint_state, dict) else None
+    )
+    if latest_batch_color_scale_mean is not None and (
+        not math.isfinite(latest_batch_color_scale_mean) or latest_batch_color_scale_mean < 0
+    ):
+        raise ValueError("Invalid latest batch color scale mean in checkpoint")
     pending_opacity_reset = None
     if isinstance(checkpoint_state, dict):
         policy = checkpoint_state.get("opacity_reset_policy_version", OPACITY_RESET_POLICY_VERSION)
@@ -764,6 +774,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     if stop_requested:
         print("[Timed stop] Restored training time already reaches the budget; no new group will run.")
     try:
+        loss_scale_logger = LossScaleLogger(
+            scene.model_path, train_cameras, loss_intensity_mode, resume_from_iter=first_iter,
+        )
+        if latest_batch_color_scale_mean is None:
+            latest_batch_color_scale_mean = loss_scale_logger.latest_batch_mean
+        print(f"[Loss scales] CSV: {loss_scale_logger.csv_path}")
+        if loss_scale_logger.archive_path is not None:
+            print(f"[Loss scales] Previous table archived to {loss_scale_logger.archive_path}")
         # Initialization and reference reconstruction precede both reported clocks.
         torch.cuda.synchronize(training_device)
         if quality_monitor is not None:
@@ -796,8 +814,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 )
                 gaussians.update_learning_rate(group_start_step)
 
-                group_cameras = train_cameras.copy()
-                random.Random(group_idx).shuffle(group_cameras)
+                group_camera_indices = list(range(len(train_cameras)))
+                random.Random(group_idx).shuffle(group_camera_indices)
+                group_cameras = [train_cameras[index] for index in group_camera_indices]
+            group_loss_scales = [None] * len(train_cameras)
             group_loss_sums = {
                 "intensity": 0.0,
                 "empty": 0.0,
@@ -845,7 +865,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             foreground_mask.to(render_intensity.device), 0.0, 1.0
                         )
 
-                    loss_intensity, _ = prepare_sonar_intensity_for_loss(
+                    loss_intensity, loss_scale = prepare_sonar_intensity_for_loss(
                         render_intensity,
                         gt_image,
                         foreground_mask,
@@ -952,8 +972,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 with training_clock.excluded_region(), torch.no_grad():
                     training_time_seconds = training_clock.snapshot_seconds()
+                    # In normalized mode the helper returns the divisor, so log
+                    # its reciprocal: the multiplier actually applied to pixels.
+                    applied_loss_scale = loss_scale.detach()
+                    if loss_intensity_mode == "normalized":
+                        applied_loss_scale = torch.clamp(applied_loss_scale, min=1e-8).reciprocal()
+                    camera_index = group_camera_indices[sample_idx - 1]
+                    group_loss_scales[camera_index] = applied_loss_scale.cpu().reshape(-1).tolist()
                     if is_group_end:
                         completed_groups = group_idx
+                        loss_scale_logger.log(
+                            group_idx, group_start_step + 1, group_end_step,
+                            training_time_seconds, group_loss_scales, group_camera_indices,
+                        )
+                        latest_batch_color_scale_mean = loss_scale_logger.latest_batch_mean
                     if (
                         is_group_end
                         and stop_after_training_seconds > 0
@@ -1066,15 +1098,20 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         print(
                             "\n[GROUP {}] Complete at iteration {}: "
                             "mean intensity={:.6f}, mean total={:.6f}, "
-                            "Gaussians={}".format(
+                            "Gaussians={}, color scale mean={}".format(
                                 group_idx,
                                 group_end_step,
                                 group_means["intensity"],
                                 group_means["total"],
                                 total_gaussians,
+                                latest_batch_color_scale_mean,
                             )
                         )
                         if tb_writer is not None:
+                            if latest_batch_color_scale_mean is not None:
+                                tb_writer.add_scalar(
+                                    "group/color_scale_mean", latest_batch_color_scale_mean, group_idx,
+                                )
                             for name, value in group_means.items():
                                 tb_writer.add_scalar(
                                     f"group_loss/{name}",
@@ -1108,6 +1145,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                     scene, render, (pipe, 1.0, lowpass_variance),
                                     log_intensity_stats=getattr(pipe, "intensity_stats", False),
                                     force=True, anti_noise_enabled=anti_noise_enabled,
+                                    latest_batch_color_scale_mean=latest_batch_color_scale_mean,
                                     output_dir=output_dir, save_test_images=save_images,
                                     additional_image_output_dirs=(test_image_output_dir,)
                                     if is_test_iteration else (),
@@ -1119,6 +1157,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 scene, render, (pipe, 1.0, lowpass_variance),
                                 log_intensity_stats=getattr(pipe, "intensity_stats", False),
                                 force=stop_requested, anti_noise_enabled=anti_noise_enabled,
+                                latest_batch_color_scale_mean=latest_batch_color_scale_mean,
                             )
 
                         save_geometry = group_end_step in effective_saving_iterations or stop_requested
@@ -1159,6 +1198,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                 "effective_iterations": group_schedule.effective_iterations,
                                 "opacity_reset_policy_version": OPACITY_RESET_POLICY_VERSION,
                                 "pending_opacity_reset": pending_opacity_reset,
+                                "latest_batch_color_scale_mean": latest_batch_color_scale_mean,
                             }
                             if quality_monitor is not None:
                                 checkpoint_state["quality_time_test_state"] = quality_monitor.state()
@@ -1346,12 +1386,14 @@ def training_report(
     output_dir=None,
     save_test_images=True,
     additional_image_output_dirs=(),
+    latest_batch_color_scale_mean=None,
 ):
     if not force and iteration not in testing_iterations:
         return
 
     torch.cuda.empty_cache()
-    result = {"test_psnr_db": None, "num_test_views": 0, "psnr_status": "empty_test_set"}
+    result = {"test_psnr_db": None, "num_test_views": 0, "psnr_status": "empty_test_set",
+              "latest_batch_color_scale_mean": latest_batch_color_scale_mean}
     device = scene.gaussians.get_xyz.device
     image_output_dir = output_dir if output_dir is not None else os.path.join(
         scene.model_path, "test_renders", "iteration_{}".format(iteration))
@@ -1377,8 +1419,14 @@ def training_report(
                     f"iter={iteration} {config['name']} idx={idx} image={viewpoint.image_name}",
                     render_pkg["raw_intensity"],
                 ))
-            render_pkg = normalize_render_intensity_for_output(render_pkg, viewpoint)
-            image = torch.clamp(render_pkg["r_intensity"], 0.0, 1.0).to(device)
+            if config["name"] == "test":
+                image, _ = normalize_test_intensity(
+                    render_pkg["raw_intensity"], latest_batch_color_scale_mean,
+                )
+                image = image.to(device)
+            else:
+                render_pkg = normalize_render_intensity_for_output(render_pkg, viewpoint)
+                image = torch.clamp(render_pkg["r_intensity"], 0.0, 1.0).to(device)
             gt_image = torch.clamp(viewpoint.original_image.to(device), 0.0, 1.0)
 
             for image_output_dir in config_image_output_dirs:
@@ -1448,8 +1496,11 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--loss_curve_plot_interval", type=int, default=100)
-    parser.add_argument("--quality_time_test", action="store_true",
-                        help="Record PSNR/mesh P2S at 26 training-time nodes and iteration/final triggers.")
+    quality_time_group = parser.add_mutually_exclusive_group()
+    quality_time_group.add_argument("--quality_time_test", action="store_true", default=True,
+                                   help="Record PSNR/mesh P2S at 26 training-time nodes and iteration/final triggers (default: enabled).")
+    quality_time_group.add_argument("--no_quality_time_test", action="store_false", dest="quality_time_test",
+                                   help="Disable the quality-versus-training-time curve and its PSNR/mesh P2S evaluations.")
     parser.add_argument("--quality_save_test_images", action="store_true",
                         help="Also export test renders inside the independent quality results directory; "
                              "test iterations always export to test_renders.")

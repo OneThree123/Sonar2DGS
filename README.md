@@ -109,6 +109,26 @@ Timing checks: `python -m unittest discover -s tests -v`. In an environment with
 the compiled CUDA extensions, enable the real GPU smoke test with
 `RUN_TRAINING_TIME_GPU_TESTS=1 python -m unittest discover -s tests -p test_training_time_gpu.py -v`.
 
+Training also writes `<output_dir>/loss_scales.csv`, with one row per complete
+training group (one pass through all training images). Each image has a fixed
+column, labeled by its zero-based camera index, image name and normalization
+method, even though training order is shuffled. `training_order` records those
+camera indices in the actual processing order. Coefficients are measured for
+each image's loss before its optimizer update; model parameters can change
+between images within a group.
+
+The table records the actual multiplier applied to rendered intensity:
+`gt_mean / clamp(render_mean, min=1e-8)` for `mean_match`, or
+`1 / clamp(render_max, min=1e-8)` for `normalized`. The `range` method stores the
+full flattened list of per-range coefficients in each image cell. Batch-wide
+`scale_min`, `scale_max`, `scale_mean`, `scale_std` (population standard deviation),
+`scale_cv` (standard deviation / absolute mean), and `scale_max_min_ratio` help
+compare variation. Statistics include all coefficients; undefined ratios and
+statistics for non-finite values are left blank. CSV writes and coefficient
+copies are excluded from training time. Incomplete groups are omitted. On
+restart or checkpoint resume, the previous CSV is archived; compatible resumes
+retain only groups completed by the checkpoint.
+
 Every `--test_iterations` node exports test renders and ground truths under
 `<output_dir>/test_renders/iteration_<effective_iteration>/`, and GS parameters
 under `<output_dir>/point_cloud/iteration_<effective_iteration>/point_cloud.ply`.
@@ -121,11 +141,33 @@ test-only nodes save GS PLY without additional geometry reconstruction.
 Coincident test/save nodes save the GS PLY once. Export work is excluded from
 pure training time, but adds wall time and disk usage.
 
-For sonar quality versus training time, enable the independent observation mode:
+After each complete training group, its arithmetic `scale_mean` becomes the
+latest batch color scale mean. Test renders all use
+`clamp(clean_raw_intensity * latest_batch_color_scale_mean, 0, 1)`, independent
+of test pixels, ground truths and camera `all`/`range` settings. Negative and
+non-finite raw pixels become zero. For `range`, the average includes every
+per-range multiplier in the group, matching `loss_scales.csv`. It uses the
+latest group only, rather than a cumulative or exponential average.
+The mean is saved as `latest_batch_color_scale_mean` in checkpoints and quality
+evaluation records, and restored on resume. Older checkpoints acquire a new
+mean after their first complete resumed group. A test with no available mean
+raises an error instead of estimating its scale from test images.
+PNG exports, TensorBoard images and test PSNR/L1 share this processed image.
+PSNR uses the floating-point result against `original_image` with data range 1,
+then averages per-view PSNR values. Ground truths retain their original scale.
+Exported PNGs are rounded to 8 bits, so offline PNG metrics can differ slightly
+from online floating-point metrics. Training losses and train-view diagnostics
+continue using their existing normalization.
+
+For sonar quality versus training time, the independent observation mode is enabled by default:
 
 ```bash
-python train.py -s <dataset> -m <output_dir> --eval --iterations 30000 --quality_time_test
+python train.py -s <dataset> -m <output_dir> --eval --iterations 30000
 ```
+
+Use `--no_quality_time_test` to disable the quality–time curve and its independent
+PSNR/P2S evaluations. The existing `--quality_time_test` flag remains supported
+for explicitly enabling it; these two flags are mutually exclusive.
 
 This adds training-time nodes at 10, 20, 30, 50, 75, 100, 120, 150, 200, 300,
 400, 500, 650, 800, 1000, 1250, 1500, 1750, 2000, 2250, 2500, 3000, 4000,
@@ -151,6 +193,10 @@ At iteration nodes, both destinations reuse the same rendered images; time-only
 and final-only quality evaluations export images there only when this flag is set.
 Use `--checkpoint_iterations <iterations...>` to save resumable checkpoints;
 quality history and pending resets resume through `--start_checkpoint`.
+The quality `config.json` records the latest training batch mean scaling
+protocol. Quality histories using a previous normalization protocol are
+incompatible and are rejected on quality-history resume; their old metrics
+are preserved. This change does not migrate quality history.
 
 The provided Open3D 0.18 environments pin NumPy 1.26.4 and OpenCV below 4.12
 to avoid incompatible NumPy 2 geometry conversions. Enable the quality GPU

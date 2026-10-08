@@ -15,7 +15,8 @@ COLUMNS = (
     "schema_version", "run_id", "session_id", "evaluation_id", "iteration", "group",
     "requested_iterations", "effective_iterations", "timing_policy_version", "training_time_scope",
     "opacity_reset_policy_version", "trigger_reasons", "covered_target_seconds",
-    "actual_training_seconds", "wall_seconds", "evaluation_seconds", "test_psnr_db", "p2s", "p2s_unit",
+    "actual_training_seconds", "wall_seconds", "evaluation_seconds", "latest_batch_color_scale_mean",
+    "test_psnr_db", "p2s", "p2s_unit",
     "num_test_views", "num_poisson_input_points", "num_pred_mesh_vertices", "num_pred_mesh_faces",
     "num_geometry_samples", "geometry_status", "psnr_status", "p2s_status", "pred_mesh_path", "error",
 )

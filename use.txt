@@ -30,6 +30,8 @@ python train.py -s /home/onethree/dataset/100lbs_bomb1 -m output/sonar_bomb1
 python train.py -s /home/onethree/dataset/UXO_sonar/sonar_data2 -m output/sonar_UXOs4 --reflection_lr 0 
 python train.py -s /home/onethree/dataset/UXO_sonar/sonar_data_big -m output/sonar_UXOsbig --reflection_lr 0 
 
+python train.py -s /home/onethree/dataset/holoocean/scene0_clean_1cm -m output/holo-sonar0
+
 python train.py -s /home/onethree/dataset/UXO_sonar/big -m output/sonar_UXOsbig3 --anti_noise 
 python train.py -s /home/onethree/dataset/UXO_sonar/big -m output/sonar_UXOsbig10 --anti_noise 
 

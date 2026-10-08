@@ -3,6 +3,7 @@
 import time
 
 from utils.geometry_metrics import GeometryEvaluator
+from utils.intensity_normalization import TEST_RENDER_NORMALIZATION_CONFIG
 from utils.quality_curve_logger import QualityCurveLogger
 from utils.quality_time_schedule import (
     OPACITY_RESET_POLICY_VERSION, QUALITY_TEST_SECONDS, QualityTimeSchedule,
@@ -32,7 +33,7 @@ class QualityTimeMonitor:
                       timing_policy_version=TIMING_POLICY_VERSION, training_time_scope=training_time_scope,
                       opacity_reset_policy_version=OPACITY_RESET_POLICY_VERSION, group_size=group_schedule.group_size,
                       test_views=[str(camera.image_name) for camera in scene.getTestCameras()],
-                      psnr_protocol="mean_of_view_psnr_original_gt_normalized_clamped_render",
+                      **TEST_RENDER_NORMALIZATION_CONFIG,
                       save_test_images=save_images, triggers=["time", "iteration", "final"],
                       wall_policy="since_initialization_completed_excludes_reference_preparation")
         self.logger = QualityCurveLogger(scene.model_path, config, state=state,

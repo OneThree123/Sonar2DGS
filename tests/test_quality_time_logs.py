@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from utils.quality_curve_logger import QualityCurveLogger
+from utils.intensity_normalization import TEST_RENDER_NORMALIZATION_CONFIG
 
 
 class QualityLogsTest(unittest.TestCase):
@@ -83,6 +84,18 @@ class QualityLogsTest(unittest.TestCase):
         record = json.loads(logger.jsonl_path.read_text())
         self.assertIsNone(record["test_psnr_db"])
         self.assertEqual(record["psnr_status"], "positive_infinity")
+
+    def test_old_psnr_protocol_rejected_without_modifying_quality_artifacts(self):
+        old_config = dict(self.config, psnr_protocol="mean_of_view_psnr_original_gt_normalized_clamped_render")
+        logger = QualityCurveLogger(self.root, old_config)
+        logger.append(self.record(2, [10]))
+        state = dict(schema_version=1, run_id=logger.run_id,
+                     config_signature=logger.config_signature, last_evaluation_id=1)
+        logger.close()
+        before = {path: path.read_bytes() for path in logger.output_dir.iterdir() if path.is_file()}
+        with self.assertRaisesRegex(ValueError, "protocol does not match"):
+            QualityCurveLogger(self.root, dict(self.config, **TEST_RENDER_NORMALIZATION_CONFIG), state=state)
+        self.assertEqual(before, {path: path.read_bytes() for path in logger.output_dir.iterdir() if path.is_file()})
 
 
 if __name__ == "__main__":
