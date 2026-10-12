@@ -306,7 +306,7 @@ __device__ __forceinline__ bool compute_tx_params(
 		    float2& tx_center_2d,
 		    float& tx_depth,         // tx_depths[idx]
 	    uint32_t& tx_tiles_touched,
-    float& raddi,
+    float& tx_raddi,
 
     const float cutoff = 3.0f
 )
@@ -385,7 +385,7 @@ __device__ __forceinline__ bool compute_tx_params(
     const float dx_v = p2.x - p3.x;
     const float dy_v = p2.y - p3.y;
 
-    raddi = dx_u * dx_u + dy_u * dy_u + dx_v * dx_v + dy_v * dy_v;
+    tx_raddi = dx_u * dx_u + dy_u * dy_u + dx_v * dx_v + dy_v * dy_v;
 
     // =========================================================
     // 3. 根据边界算 tile 覆盖范围
@@ -602,6 +602,7 @@ __global__ void preprocessCUDA(
 	/*计算透射相关参数：
 	变换矩阵、投影边界、tiles数量、深度
 	*/
+	float tx_raddi = 0.0f;
 	if (!compute_tx_params(
 			gs_trans[idx],
 				gs_scales[idx],
@@ -617,7 +618,7 @@ __global__ void preprocessCUDA(
 					tx_centers_2d[idx],
 					tx_depths[idx],
 				tx_tiles_touched[idx],
-            r_raddi[idx]))
+	            tx_raddi))
 	{
 		return;
 	}
@@ -653,6 +654,14 @@ __global__ void preprocessCUDA(
 	{
 		return;
 	}
+
+	// gs_raddi is defined in the final sonar image coordinate system.
+	// Store the sum of squares of the image-space bounding-box coordinates:
+	// xmin^2 + xmax^2 + ymin^2 + ymax^2.
+	const float4 image_bound = img_bounds[idx];
+	r_raddi[idx] =
+		image_bound.x * image_bound.x + image_bound.y * image_bound.y +
+		image_bound.z * image_bound.z + image_bound.w * image_bound.w;
 
 #if DEBUG_PREPROCESS_REPROJECT
     {
