@@ -1170,26 +1170,28 @@ __global__ void preprocessBackwardCUDA(
     dscale.x += dsu * gs_scale_modifier;
     dscale.y += dsv * gs_scale_modifier;
 
-    float dmean2D_x = 0.0f;
-    float dmean2D_y = 0.0f;
-    const float rho2 = o_s.x * o_s.x + o_s.y * o_s.y;
-    if (rho2 > 1e-8f)
-    {
-        const float inv_dtheta = float(img_width) / fmaxf(fovx, 1e-8f);
-        dmean2D_x = (-o_s.y * do_s.x + o_s.x * do_s.y) / inv_dtheta;
-        dmean2D_x *= 0.5f * float(img_width);
-    }
-    if (range > 1e-8f)
-    {
-        const float inv_dr = float(img_height) / fmaxf(range_max, 1e-8f);
-        dmean2D_y = glm::dot(do_s, o_s / range) / inv_dr;
-        dmean2D_y *= 0.5f * float(img_height);
-    }
-
     dpos += rotate_sonar_to_world_bwd(do_s, viewmatrix);
     dR[0] += rotate_sonar_to_world_bwd(dru_s, viewmatrix);
     dR[1] += rotate_sonar_to_world_bwd(drv_s, viewmatrix);
     dR[2] += rotate_sonar_to_world_bwd(dn_s, viewmatrix);
+
+	// Project the complete dL/d(position) vector onto the perspective TX
+	// image.  The output is in normalized device-coordinate units, matching
+	// the old azimuth-side convention while giving both components the same
+	// unit.  For the sonar perspective projection (see getProjectionMatrix),
+	// ndc_x = projmatrix[4] * y / x and ndc_y = projmatrix[9] * z / x.
+	// Holding the depth x fixed gives dy/dndc_x = x/projmatrix[4] and
+	// dz/dndc_y = x/projmatrix[9].
+	const glm::vec3 dpos_s = rotate_world_to_sonar_bwd(dpos, viewmatrix);
+	const float tx_depth = o_s.x;
+	const float tx_proj_x = projmatrix[4];
+	const float tx_proj_y = projmatrix[9];
+	float dmean2D_x = 0.0f;
+	float dmean2D_y = 0.0f;
+	if (fabsf(tx_depth) > 1e-8f && fabsf(tx_proj_x) > 1e-8f)
+		dmean2D_x = dpos_s.y * tx_depth / tx_proj_x;
+	if (fabsf(tx_depth) > 1e-8f && fabsf(tx_proj_y) > 1e-8f)
+		dmean2D_y = dpos_s.z * tx_depth / tx_proj_y;
 
     dL_dgs_trans[idx] = dpos;
     dL_dgs_quats[idx] = quat_to_rotmat_vjp(quat, dR);

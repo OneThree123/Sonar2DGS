@@ -655,13 +655,11 @@ __global__ void preprocessCUDA(
 		return;
 	}
 
-	// gs_raddi is defined in the final sonar image coordinate system.
-	// Store the sum of squares of the image-space bounding-box coordinates:
-	// xmin^2 + xmax^2 + ymin^2 + ymax^2.
-	const float4 image_bound = img_bounds[idx];
-	r_raddi[idx] =
-		image_bound.x * image_bound.x + image_bound.y * image_bound.y +
-		image_bound.z * image_bound.z + image_bound.w * image_bound.w;
+	// Use the projected size on the perspective TX image for densification.
+	// tx_raddi was computed from the projected principal-axis endpoints in
+	// compute_tx_params().  Keep the final-image visibility test above, but
+	// expose the TX-space size to the training loop.
+	r_raddi[idx] = tx_raddi;
 
 #if DEBUG_PREPROCESS_REPROJECT
     {
