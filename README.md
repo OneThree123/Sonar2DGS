@@ -1,328 +1,75 @@
-# 2D Gaussian Splatting for Geometrically Accurate Radiance Fields
+# Sonar2DGS
 
-[Project page](https://surfsplatting.github.io/) | [Paper](https://arxiv.org/pdf/2403.17888) | [Video](https://www.youtube.com/watch?v=oaHCtB6yiKU) | [Surfel Rasterizer (CUDA)](https://github.com/hbb1/diff-surfel-rasterization) | [Surfel Rasterizer (Python)](https://colab.research.google.com/drive/1qoclD7HJ3-o0O1R8cvV3PxLhoDCMsH8W?usp=sharing) | [DTU+COLMAP (3.5GB)](https://drive.google.com/drive/folders/1SJFgt8qhQomHX55Q4xSvYE2C6-8tFll9) | [SIBR Viewer Pre-built for Windows](https://github.com/RongLiu-Leo/Gaussian-Splatting-Monitor/releases/download/v1.0/GS_Monitor.zip) | [Web Viewer](https://github.com/mkkellogg/GaussianSplats3D) <br>
+**Differentiable 2D Gaussian Splatting for Forward-Looking Sonar 3D Reconstruction**
 
-![Teaser image](assets/teaser.jpg)
+[Project Repository](https://github.com/OneThree123/Sonar2DGS) · **Preprint: coming soon**
 
-This repo contains the official implementation for the paper "2D Gaussian Splatting for Geometrically Accurate Radiance Fields". Our work represents a scene with a set of 2D oriented disks (surface elements) and rasterizes the surfels with [perspective correct differentiable raseterization](https://colab.research.google.com/drive/1qoclD7HJ3-o0O1R8cvV3PxLhoDCMsH8W?usp=sharing). Our work also develops regularizations that enhance the reconstruction quality. We also devise meshing approaches for Gaussian splatting.
+Sonar2DGS is a scene-specific 3D reconstruction framework for forward-looking imaging sonar. It represents scenes with planar 2D Gaussian surfels and optimizes them using a differentiable sonar renderer.
 
+## Features
 
-## ⭐ New Features 
-- 2025/12/19: Our work is featured in an in-depth blog post on [LearnOpenCV](https://learnopencv.com/)! Thanks to [Shubham Anand](https://www.linkedin.com/in/shubham-anand-91a10b211/).
-- 2024/07/20: Web-based viewer [GaussianSplats3D](https://github.com/mkkellogg/GaussianSplats3D) also supports 2DGS. Thanks to [Mark Kellogg](https://github.com/mkkellogg).
-- 2024/07/19: [Colab Notebook](https://github.com/atakan-topaloglu/2d_gaussian_splatting_colab) is supported! Thanks to [atakan-topaloglu](https://github.com/atakan-topaloglu)
-- 2024/06/10: [SIBR Viewer](https://github.com/RongLiu-Leo/2d-gaussian-splatting) is supported! Thanks to [Rong](https://github.com/RongLiu-Leo/).
-- 2024/06/05: [Remote Viewer](https://github.com/hwanhuh/2D-GS-Viser-Viewer) based on Viser is supported! Thanks to [HwanHeo](https://github.com/hwanhuh).
-- 2024/05/30:  Fixed a bug related to unbounded meshing. The foreground mesh quality should now be consistent with the bounded mesh.
-- 2024/05/17: Improve training speed by 30%~40% through the [cuda operator fusing](https://github.com/hbb1/diff-surfel-rasterization/pull/7). Please update the diff-surfel-rasterization submodule if you have already installed it. 
-    ```bash
-    git submodule update --remote  
-    pip install submodules/diff-surfel-rasterization
-    ```
-- 2024/05/05: Important updates - Now our algorithm supports **unbounded mesh extraction**!
-Our key idea is to contract the space into a sphere and then perform **adaptive TSDF truncation**. 
+- Models surface-normal-dependent acoustic reflection.
+- Performs ray-wise occlusion computation and pixel-wise echo accumulation.
+- Optimizes sonar image losses together with geometry regularization and Gaussian density control.
+- Supports model training, rendering, and mesh extraction.
 
-![visualization](assets/unbounded.gif)
+## Results
 
-## 🎓 Community Resources & Tutorials
+### Geometry reconstruction
 
-- **gsplat library documentation** (official rasterization API reference)  
-  https://docs.gsplat.studio/main/apis/rasterization.html#id1
+![Geometry comparison on the mountain scene](assets/geometry_comparison_mountain_2x3.png)
 
-- **GaussianSplats3D** – Popular WebGL/Three.js viewer with strong community support  
-  https://github.com/mkkellogg/GaussianSplats3D
+### Sonar rendering
 
-- **SuperSplat** – High-performance WebGPU viewer by PlayCanvas  
-  https://github.com/playcanvas/supersplat
+![Rendering comparison on the mountain scene](assets/rendering_comparison_mountain_2x3.png)
 
-- **In-Depth Practitioner Guide** – Comprehensive tutorial on the full 2D Gaussian Splatting pipeline (theory to implementation) by Shubham Anand  
-  [LearnOpenCV Blog Post](https://learnopencv.com/2d-gaussian-splatting/)
+## Environment
 
-- **Diff-Surfel-Tracing** - A differentiable ray-tracing implementation built on the surfel representation by [xbillowy](https://github.com/xbillowy)
-   https://github.com/xbillowy/diff-surfel-tracing
+Tested with:
 
-## SIBR Viewer
+- Linux, NVIDIA GPU, CUDA 12.8-compatible PyTorch
+- Python 3.10
+- PyTorch 2.10, Open3D 0.18, NumPy 1.26
 
-
-https://github.com/RongLiu-Leo/2d-gaussian-splatting/assets/102014841/b75dd9a7-e3ee-4666-99ff-8c9121ff66dc
-
-
-The Pre-built Viewer for Windows can be found [here](https://github.com/RongLiu-Leo/Gaussian-Splatting-Monitor/releases/download/v1.0/GS_Monitor.zip). If you use Ubuntu or want to check the viewer usage, please refer to [GS Monitor](https://github.com/RongLiu-Leo/Gaussian-Splatting-Monitor).
-### How to use
-Firstly open the viewer, 
-```shell
-<path to downloaded/compiled viewer>/bin/SIBR_remoteGaussian_app_rwdi
-```
-and then
-```shell
-# Monitor the training process
-python train.py -s <path to COLMAP or NeRF Synthetic dataset> 
-# View the trained model
-python view.py -s <path to COLMAP or NeRF Synthetic dataset> -m <path to trained model> 
-```
-
-## Installation
+Create the environment and compile the CUDA extensions:
 
 ```bash
-# download
-git clone https://github.com/hbb1/2d-gaussian-splatting.git --recursive
-
-# if you have an environment used for 3dgs, use it
-# if not, create a new environment
 conda env create --file environment.yml
 conda activate surfel_splatting
+
+pip install submodules/diff-surfel-rasterization
+pip install submodules/simple-knn
+
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 ```
-## Training
-To train a scene, simply use
-```bash
-python train.py -s <path to COLMAP or NeRF Synthetic dataset>
-```
-Commandline arguments for regularizations
-```bash
---lambda_normal  # hyperparameter for normal consistency
---lambda_distortion # hyperparameter for depth distortion
---depth_ratio # 0 for mean depth and 1 for median depth, 0 works for most cases
-```
-**Tips for adjusting the parameters on your own dataset:**
-- For unbounded/large scenes, we suggest using mean depth, i.e., ``depth_ratio=0``,  for less "disk-aliasing" artifacts.
 
-The sonar training loop records `training_time_seconds` using elapsed CPU/GPU
-time, including data preparation within the loop, learning rate updates,
-forward/loss/backward, optimizer updates, parameter bounds, densification,
-pruning and opacity resets. Initialization, evaluation, geometry export,
-checkpoint capture/save, logs, HTML and GUI work are excluded. The training
-device is synchronized at the boundaries so asynchronous GPU work is assigned
-to the correct interval. CSV, TensorBoard, progress, GUI and time budgets use
-the same clock; the CUDA Event `iter_time` metric has been removed.
+## Usage
 
-Use `--stop_after_training_seconds 3000` (or `7000`) to stop at the first complete
-training group that reaches the budget, after its densification. Opacity resets
-scheduled by a group run before the next group, after evaluation and saving;
-pending resets are preserved in checkpoints and are skipped when no new group
-will run. The actual time may exceed the budget by one group. Set it to `0` to
-disable time stopping; `--iterations` remains an independent limit.
-Version 3 checkpoints preserve the clock. Legacy checkpoints start at zero for
-the resumed segment (`training_time_scope=since_resume`); incompatible or
-restarted loss histories are preserved under `loss_curves/archive_<id>/`.
-
-Timing checks: `python -m unittest discover -s tests -v`. In an environment with
-the compiled CUDA extensions, enable the real GPU smoke test with
-`RUN_TRAINING_TIME_GPU_TESTS=1 python -m unittest discover -s tests -p test_training_time_gpu.py -v`.
-
-Training also writes `<output_dir>/loss_scales.csv`, with one row per complete
-training group (one pass through all training images). Each image has a fixed
-column, labeled by its zero-based camera index, image name and normalization
-method, even though training order is shuffled. `training_order` records those
-camera indices in the actual processing order. Coefficients are measured for
-each image's loss before its optimizer update; model parameters can change
-between images within a group.
-
-The table records the actual multiplier applied to rendered intensity:
-`gt_mean / clamp(render_mean, min=1e-8)` for `mean_match`, or
-`1 / clamp(render_max, min=1e-8)` for `normalized`. The `range` method stores the
-full flattened list of per-range coefficients in each image cell. Batch-wide
-`scale_min`, `scale_max`, `scale_mean`, `scale_std` (population standard deviation),
-`scale_cv` (standard deviation / absolute mean), and `scale_max_min_ratio` help
-compare variation. Statistics include all coefficients; undefined ratios and
-statistics for non-finite values are left blank. CSV writes and coefficient
-copies are excluded from training time. Incomplete groups are omitted. On
-restart or checkpoint resume, the previous CSV is archived; compatible resumes
-retain only groups completed by the checkpoint.
-
-Every `--test_iterations` node exports test renders and ground truths under
-`<output_dir>/test_renders/iteration_<effective_iteration>/`, and GS parameters
-under `<output_dir>/point_cloud/iteration_<effective_iteration>/point_cloud.ply`.
-These exports are always enabled, regardless of `--eval`, `--quality_time_test`
-or `--quality_save_test_images`. Iteration targets still round up to complete
-training groups; targets in the same group produce one export. Unreached targets
-are not exported, and checkpoint resumes skip already completed groups.
-`--save_iterations` continues to control the existing GS and geometry exports;
-test-only nodes save GS PLY without additional geometry reconstruction.
-Coincident test/save nodes save the GS PLY once. Export work is excluded from
-pure training time, but adds wall time and disk usage.
-
-After each complete training group, its arithmetic `scale_mean` becomes the
-latest batch color scale mean. Test renders all use
-`clamp(clean_raw_intensity * latest_batch_color_scale_mean, 0, 1)`, independent
-of test pixels, ground truths and camera `all`/`range` settings. Negative and
-non-finite raw pixels become zero. For `range`, the average includes every
-per-range multiplier in the group, matching `loss_scales.csv`. It uses the
-latest group only, rather than a cumulative or exponential average.
-The mean is saved as `latest_batch_color_scale_mean` in checkpoints and quality
-evaluation records, and restored on resume. Older checkpoints acquire a new
-mean after their first complete resumed group. A test with no available mean
-raises an error instead of estimating its scale from test images.
-PNG exports, TensorBoard images and test PSNR/L1 share this processed image.
-PSNR uses the floating-point result against `original_image` with data range 1,
-then averages per-view PSNR values. Ground truths retain their original scale.
-Exported PNGs are rounded to 8 bits, so offline PNG metrics can differ slightly
-from online floating-point metrics. Training losses and train-view diagnostics
-continue using their existing normalization.
-
-For sonar quality versus training time, the independent observation mode is enabled by default:
+Prepare a forward-looking sonar dataset and provide its path with `-s`.
 
 ```bash
-python train.py -s <dataset> -m <output_dir> --eval --iterations 30000
+# Train
+python train.py -s <dataset_path> -m <output_path>
+
+# View a trained model
+python view.py -s <dataset_path> -m <output_path>
 ```
 
-Use `--no_quality_time_test` to disable the quality–time curve and its independent
-PSNR/P2S evaluations. The existing `--quality_time_test` flag remains supported
-for explicitly enabling it; these two flags are mutually exclusive.
-
-This adds training-time nodes at 10, 20, 30, 50, 75, 100, 120, 150, 200, 300,
-400, 500, 650, 800, 1000, 1250, 1500, 1750, 2000, 2250, 2500, 3000, 4000,
-5000, 6000 and 7000 seconds. Existing `--test_iterations` and final evaluation
-remain active. A completed group merges all crossed nodes and trigger reasons
-into one evaluation and one CSV row, using actual training time. Unreached
-nodes are not evaluated after training ends. A time budget still requires
-`--stop_after_training_seconds` explicitly.
-
-The dataset must contain `dense_points3d.ply`. Its Poisson reference mesh is
-prepared once and cached before timing starts. Predictions use the same GS
-sampling/Poisson pipeline as model exports; P2S is the mean distance from
-100,000 fixed-seed, area-weighted predicted mesh surface samples to reference
-triangles, in meters. All evaluation and export time is excluded from training.
-The reported total run duration also excludes reference preparation.
-
-Results are saved under `<output_dir>/quality_time_tests/`: `reference/` holds
-the cached GT mesh, and `run_<id>/` contains `metrics.csv`, `metrics.jsonl`,
-`summary.json`, per-evaluation meshes and `quality_time.html`. The HTML works
-offline with linear/log time axes and hover details. Use
-`--quality_save_test_images` to export renders and ground truths there too.
-At iteration nodes, both destinations reuse the same rendered images; time-only
-and final-only quality evaluations export images there only when this flag is set.
-Use `--checkpoint_iterations <iterations...>` to save resumable checkpoints;
-quality history and pending resets resume through `--start_checkpoint`.
-The quality `config.json` records the latest training batch mean scaling
-protocol. Quality histories using a previous normalization protocol are
-incompatible and are rejected on quality-history resume; their old metrics
-are preserved. This change does not migrate quality history.
-
-The provided Open3D 0.18 environments pin NumPy 1.26.4 and OpenCV below 4.12
-to avoid incompatible NumPy 2 geometry conversions. Enable the quality GPU
-smoke test with `RUN_QUALITY_TIME_GPU_TESTS=1 python -m unittest discover -s tests -p test_quality_time_gpu.py -v`.
-
-## Testing
-### Bounded Mesh Extraction
-To export a mesh within a bounded volume, simply use
-```bash
-python render.py -m <path to pre-trained model> -s <path to COLMAP dataset> 
-```
-Commandline arguments you should adjust accordingly for meshing for bounded TSDF fusion, use
-```bash
---depth_ratio # 0 for mean depth and 1 for median depth
---voxel_size # voxel size
---depth_trunc # depth truncation
-```
-If these arguments are not specified, the script will automatically estimate them using the camera information.
-### Unbounded Mesh Extraction
-To export a mesh with an arbitrary size, we devised an unbounded TSDF fusion with space contraction and adaptive truncation.
-```bash
-python render.py -m <path to pre-trained model> -s <path to COLMAP dataset> --mesh_res 1024
-```
-
-## Quick Examples
-Assuming you have downloaded [MipNeRF360](https://jonbarron.info/mipnerf360/), simply use
-```bash
-python train.py -s <path to m360>/<garden> -m output/m360/garden
-# use our unbounded mesh extraction!!
-python render.py -s <path to m360>/<garden> -m output/m360/garden --unbounded --skip_test --skip_train --mesh_res 1024
-# or use the bounded mesh extraction if you focus on foreground
-python render.py -s <path to m360>/<garden> -m output/m360/garden --skip_test --skip_train --mesh_res 1024
-```
-If you have downloaded the [DTU dataset](https://drive.google.com/drive/folders/1SJFgt8qhQomHX55Q4xSvYE2C6-8tFll9), you can use
-```bash
-python train.py -s <path to dtu>/<scan105> -m output/date/scan105 -r 2 --depth_ratio 1
-python render.py -r 2 --depth_ratio 1 --skip_test --skip_train
-```
-**Custom Dataset**: We use the same COLMAP loader as 3DGS, you can prepare your data following [here](https://github.com/graphdeco-inria/gaussian-splatting?tab=readme-ov-file#processing-your-own-scenes). 
-
-> [!WARNING] 
-> In our **preprocessed DTU dataset**, we store the mask in the alpha channel. When using the **DTU dataset** in the [gaussian-splatting repository](https://github.com/graphdeco-inria/gaussian-splatting), please note that the background may be masked. To train DTU with background, we have commented [these lines](https://github.com/hbb1/2d-gaussian-splatting/blob/df1f6c684cc4e41a34937fd45a7847260e9c6cd7/scene/cameras.py#L43C1-L48C38) out.
-
-## Full evaluation
-We provide scripts to evaluate our method of novel view synthesis and geometric reconstruction.
-<details>
-<summary><span style="font-weight: bold;">Explanation of Performance Differences to the Paper</span></summary>
-
-We have re-implemented the repository for improved efficiency, which has slightly impacted performance compared to the original paper. Two factors have influenced this change:
-
-- 📈 We fixed some minor bugs, such as a half-pixel shift in TSDF fusion, resulting in improved geometry reconstruction.
-
-- 📉 We removed the gradient of the low-pass filter used for densification, which reduces the number of Gaussians. As a result, the PSNR has slightly dropped, but we believe this trade-off is worthwhile for real-world applications.
-
-You can report either the numbers from the paper or from this implementation, as long as they are discussed in a comparable setting.
-</details>
-
-#### Novel View Synthesis
-For novel view synthesis on [MipNeRF360](https://jonbarron.info/mipnerf360/) (which also works for other colmap datasets), use
-```bash
-python scripts/m360_eval.py -m60 <path to the MipNeRF360 dataset>
-```
-
-#### Geometry reconstruction
-For geometry reconstruction on DTU dataset, please download the preprocessed data from [Drive](https://drive.google.com/drive/folders/1SJFgt8qhQomHX55Q4xSvYE2C6-8tFll9) or [Hugging Face](https://huggingface.co/datasets/dylanebert/2DGS). You also need to download the ground truth [DTU point cloud](https://roboimagedata.compute.dtu.dk/?page_id=36). 
-```bash
-python scripts/dtu_eval.py --dtu <path to the preprocessed DTU dataset>   \
-     --DTU_Official <path to the official DTU dataset>
-```
-We provide <a> Evaluation Results (Pretrained, Meshes)</a>. 
-<details>
-<summary><span style="font-weight: bold;">Table Results</span></summary>
-
-Chamfer distance on DTU dataset (lower is better)
-
-|   | 24   | 37   | 40   | 55   | 63   | 65   | 69   | 83   | 97   | 105  | 106  | 110  | 114  | 118  | 122  | Mean |
-|----------|------|------|------|------|------|------|------|------|------|------|------|------|------|------|------|------|
-| Paper    | 0.48 | 0.91 | 0.39 | 0.39 | 1.01 | 0.83 | 0.81 | 1.36 | 1.27 | 0.76 | 0.70 | 1.40 | 0.40 | 0.76 | 0.52 | 0.80 |
-| Reproduce | 0.46 | 0.80 | 0.33 | 0.37 | 0.95 | 0.86 | 0.80 | 1.25 | 1.24 | 0.67 | 0.67 | 1.24 | 0.39 | 0.64 | 0.47 | 0.74 |
-</details>
-
-For geometry reconstruction on TnT dataset, please download the preprocessed [TnT_data](https://huggingface.co/datasets/ZehaoYu/gaussian-opacity-fields/tree/main). You also need to download the ground truth [TnT_GT](https://www.tanksandtemples.org/download/), including ground truth point cloud, alignments and cropfiles.
-
-> [!IMPORTANT]  
-> Due to historical issue, you should use open3d==0.10.0 for evaluating TNT.
-
-```bash
-# use open3d 0.18.0, skip metrics
-python scripts/tnt_eval.py --TNT_data <path to the preprocessed TNT dataset>   \
-     --TNT_GT <path to the official TNT evaluation dataset> --skip_metrics
-
-# use open3d 0.10.0, skip traing and rendering
-python scripts/tnt_eval.py --TNT_data <path to the preprocessed TNT dataset>   \
-     --TNT_GT <path to the official TNT evaluation dataset> --skip_training --skip_rendering
-```
-<details>
-<summary><span style="font-weight: bold;">Table Results</span></summary>
-
-F1 scores on TnT dataset (higher is better)
-
-|    | Barn   | Caterpillar | Ignatius | Truck  | Meetingroom | Courthouse | Mean | 
-|--------|--------|-------------|----------|--------|-------------|------------|------------|
-| Reproduce | 0.41  | 0.23      | 0.51   | 0.45 | 0.17      | 0.15      | 0.32 |
-</details>
-
-
-## FAQ
-- **Training does not converge.**  If your camera's principal point does not lie at the image center, you may experience convergence issues. Our code only supports the ideal pinhole camera format, so you may need to make some modifications. Please follow the instructions provided [here](https://github.com/graphdeco-inria/gaussian-splatting/issues/144#issuecomment-1938504456) to make the necessary changes. We have also modified the rasterizer in the latest [commit](https://github.com/hbb1/diff-surfel-rasterization/pull/6) to support data accepted by 3DGS. To avoid further issues, please update to the latest commit.
-
-- **No mesh / Broken mesh.** When using the *Bounded mesh extraction* mode, it is necessary to adjust the `depth_trunc` parameter to perform TSDF fusion to extract meshes. On the other hand, *Unbounded mesh extraction* does not require tuning the parameters but is less efficient.  
-
-- **Can 3DGS's viewer be used to visualize 2DGS?** Technically, you can export 2DGS to 3DGS's ply file by appending an additional zero scale. However, due to the inaccurate affine projection of 3DGS's viewer, you may see some distorted artefacts. We are currently working on a viewer for 2DGS, so stay tuned for updates.
-
-## Acknowledgements
-This project is built upon [3DGS](https://github.com/graphdeco-inria/gaussian-splatting). The TSDF fusion for extracting mesh is based on [Open3D](https://github.com/isl-org/Open3D). The rendering script for MipNeRF360 is adopted from [Multinerf](https://github.com/google-research/multinerf/), while the evaluation scripts for DTU and Tanks and Temples dataset are taken from [DTUeval-python](https://github.com/jzhangbs/DTUeval-python) and [TanksAndTemples](https://github.com/isl-org/TanksAndTemples/tree/master/python_toolbox/evaluation), respectively. The fusing operation for accelerating the renderer is inspired by [Han's repodcue](https://github.com/Han230104/2D-Gaussian-Splatting-Reproduce). We thank all the authors for their great repos. 
-
+Run `python train.py --help` to view all training options.
 
 ## Citation
-If you find our code or paper helps, please consider citing:
+
+The manuscript is currently in preprint preparation. Please cite the following entry for now:
+
 ```bibtex
-@inproceedings{Huang2DGS2024,
-    title={2D Gaussian Splatting for Geometrically Accurate Radiance Fields},
-    author={Huang, Binbin and Yu, Zehao and Chen, Anpei and Geiger, Andreas and Gao, Shenghua},
-    publisher = {Association for Computing Machinery},
-    booktitle = {SIGGRAPH 2024 Conference Papers},
-    year      = {2024},
-    doi       = {10.1145/3641519.3657428}
+@article{zhao2026sonar2dgs,
+  title={Sonar2DGS: Differentiable 2D Gaussian Splatting for Forward-Looking Sonar 3D Reconstruction},
+  author={Zhao, Yibo and Wen, Huafeng and Wang, Xin and Li, Jiangang},
+  note={Preprint in preparation},
+  year={2026}
 }
 ```
+
+## Acknowledgements
+
+This project builds on [2D Gaussian Splatting](https://github.com/hbb1/2d-gaussian-splatting) and its open-source dependencies.
